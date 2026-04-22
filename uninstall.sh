@@ -30,6 +30,20 @@ done
 
 command -v jq >/dev/null 2>&1 || die "jq is required."
 
+# Remove skill symlink if it points to our dir
+SKILL_LINK="$HOME/.claude/skills/reflect-and-refine"
+if [ -L "$SKILL_LINK" ]; then
+  target="$(readlink "$SKILL_LINK")"
+  if [ "$target" = "$SKILL_ROOT" ]; then
+    rm "$SKILL_LINK"
+    echo "skill symlink removed: $SKILL_LINK"
+  else
+    echo "note: $SKILL_LINK points to $target (not our dir); leaving alone"
+  fi
+elif [ -e "$SKILL_LINK" ]; then
+  echo "warning: $SKILL_LINK exists but is not a symlink; leaving alone (remove manually if needed)"
+fi
+
 if [ -n "$SETTINGS_FILE" ] && [ -f "$SETTINGS_FILE" ]; then
   BACKUP="$SETTINGS_FILE.bak.$(date +%s).rar-uninstall"
   cp "$SETTINGS_FILE" "$BACKUP"

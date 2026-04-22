@@ -61,6 +61,24 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required."
 [ -f "$HOOK_SCRIPT" ] || die "hook script missing: $HOOK_SCRIPT"
 chmod +x "$HOOK_SCRIPT"
 
+# Install skill into ~/.claude/skills/ as a symlink so updates flow through
+SKILLS_DIR="$HOME/.claude/skills"
+SKILL_LINK="$SKILLS_DIR/reflect-and-refine"
+mkdir -p "$SKILLS_DIR"
+if [ -L "$SKILL_LINK" ]; then
+  current="$(readlink "$SKILL_LINK")"
+  if [ "$current" != "$SKILL_ROOT" ]; then
+    echo "warning: $SKILL_LINK points to $current, replacing with $SKILL_ROOT" >&2
+    rm "$SKILL_LINK"
+    ln -s "$SKILL_ROOT" "$SKILL_LINK"
+  fi
+elif [ -e "$SKILL_LINK" ]; then
+  die "$SKILL_LINK exists and is not a symlink. Remove it manually then re-run install."
+else
+  ln -s "$SKILL_ROOT" "$SKILL_LINK"
+  echo "skill linked: $SKILL_LINK -> $SKILL_ROOT"
+fi
+
 SETTINGS_FILE="${SETTINGS_FILE:-$(detect_settings)}"
 SETTINGS_DIR="$(dirname "$SETTINGS_FILE")"
 mkdir -p "$SETTINGS_DIR"

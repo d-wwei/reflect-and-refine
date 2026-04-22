@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""
+reflect-and-refine Stop hook gate.
+
+Reads Claude Code Stop hook JSON from stdin. Decides whether to:
+- exit 0 silently (gate closed or rate-limited), OR
+- emit a block JSON that instructs the main agent to run a reviewer sub-agent.
+
+Fail-open: any uncaught exception results in exit 0 (we never block the user's
+stop due to our own bug). Errors are logged to ~/.reflect-and-refine/logs/.
+"""
+
+import json
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from datetime import datetime
+
+HOME = Path(os.path.expanduser("~"))
+CONFIG_DIR = HOME / ".reflect-and-refine"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_DIR = CONFIG_DIR / "logs"
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+PROMPT_TEMPLATE = SKILL_ROOT / "prompts" / "reviewer-template.md"
+
+SHUTDOWN_MARKER_ARGS = "shutdown"
+DEFAULT_MAX_BLOCKS_PER_TURN = 3
+
+
+def log_error(msg: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logfile = LOG_DIR / f"errors-{datetime.now():%Y%m%d}.log"
+        with logfile.open("a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass  # last-resort: don't let logging itself break us
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return {}
+    with CONFIG_FILE.open() as f:
+        return json.load(f)
+
+
+def read_transcript(path: Path) -> list[dict]:
+    records = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def gate_state(records: list[dict], registered_skills: set[str]) -> str:
+    """
+    Scan transcript from newest to oldest. Return 'OPEN' or 'CLOSED'.
+    - Last marker is a shutdown for reflect-and-refine -> CLOSED
+    - Last marker is an invocation of any registered skill -> OPEN
+    - No markers found -> CLOSED
+    """
+    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
+    args_pat = re.compile(r"<command-args>([^<]*)</command-args>")
+    for rec in reversed(records):
+        if rec.get("type") != "user":
+            continue
+        content = rec.get("message", {}).get("content", "")
+        if not isinstance(content, str):
+            continue
+        m = name_pat.search(content)
+        if not m:
+            continue
+        skill = m.group(1)
+        args_match = args_pat.search(content)
+        args = args_match.group(1).strip() if args_match else ""
+
+        if skill == "reflect-and-refine" and args == SHUTDOWN_MARKER_ARGS:
+            return "CLOSED"
+        if skill in registered_skills:
+            return "OPEN"
+    return "CLOSED"
+
+
+def last_user_timestamp(records: list[dict]) -> str:
+    for rec in reversed(records):
+        if rec.get("type") == "user":
+            return rec.get("timestamp", "")
+    return ""
+
+
+def last_user_command_parts(records: list[dict]) -> tuple[str, str]:
+    """
+    Return (request_text, prior_assistant_text) for the most recent 'real' user
+    message (one containing a <command-name> OR a plain text message that is not
+    a hook attachment/system reminder) and the most recent assistant text
+    response BEFORE Stop fired.
+    """
+    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
+    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
+
+    request_text = ""
+    for rec in reversed(records):
+        if rec.get("type") != "user":
+            continue
+        content = rec.get("message", {}).get("content", "")
+        if not isinstance(content, str):
+            continue
+        if "<command-name>" in content:
+            args_match = args_pat.search(content)
+            name_match = name_pat.search(content)
+            if name_match and args_match:
+                request_text = f"/{name_match.group(1)} {args_match.group(1).strip()}"
+            elif name_match:
+                request_text = f"/{name_match.group(1)}"
+            else:
+                request_text = content[:2000]
+            break
+        if "<system-reminder>" in content or "<hook-" in content:
+            continue
+        request_text = content.strip()[:4000]
+        break
+
+    agent_text = ""
+    for rec in reversed(records):
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+            agent_text = "\n".join(texts).strip()
+        elif isinstance(content, str):
+            agent_text = content.strip()
+        if agent_text:
+            agent_text = agent_text[:8000]
+            break
+
+    return request_text, agent_text
+
+
+def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bool:
+    """
+    Per-turn counter. Returns True if we should block, False if rate-limited.
+    State format: "<last_user_ts> <count>\n" in /tmp/rar-<session>.state
+    """
+    state_file = Path(f"/tmp/rar-{session_id}.state")
+    saved_ts, saved_count = "", 0
+    if state_file.exists():
+        try:
+            parts = state_file.read_text().strip().split(maxsplit=1)
+            if len(parts) == 2:
+                saved_ts, saved_count = parts[0], int(parts[1])
+        except Exception:
+            saved_ts, saved_count = "", 0
+
+    if last_user_ts != saved_ts:
+        # New user turn -> reset
+        count = 0
+    else:
+        count = saved_count
+
+    if count >= max_blocks:
+        return False
+
+    try:
+        state_file.write_text(f"{last_user_ts} {count + 1}\n")
+    except Exception as e:
+        log_error(f"failed to write state {state_file}: {e}")
+
+    return True
+
+
+def build_block_reason(request_text: str, agent_text: str) -> str:
+    tpl = PROMPT_TEMPLATE.read_text()
+    return tpl.replace("{USER_REQUEST}", request_text or "(transcript did not yield a clear user request — review based on the full transcript)") \
+              .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
+
+
+def main() -> None:
+    try:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return
+        payload = json.loads(raw)
+    except Exception as e:
+        log_error(f"bad stdin: {e}")
+        return
+
+    transcript_path = payload.get("transcript_path", "")
+    session_id = payload.get("session_id", "")
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return
+
+    try:
+        config = load_config()
+    except Exception as e:
+        log_error(f"bad config: {e}")
+        return
+
+    registered = set(config.get("registered_skills", []))
+    if not registered:
+        return  # nothing registered -> never fire
+
+    try:
+        records = read_transcript(Path(transcript_path))
+    except Exception as e:
+        log_error(f"read transcript failed: {e}")
+        return
+
+    try:
+        state = gate_state(records, registered)
+    except Exception as e:
+        log_error(f"gate_state failed: {e}")
+        return
+
+    if state != "OPEN":
+        return
+
+    max_blocks = int(config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN))
+    last_ts = last_user_timestamp(records)
+    should_block = increment_counter(session_id or "unknown", last_ts, max_blocks)
+    if not should_block:
+        return
+
+    try:
+        request_text, agent_text = last_user_command_parts(records)
+        reason = build_block_reason(request_text, agent_text)
+    except Exception as e:
+        log_error(f"build reason failed: {e}")
+        return
+
+    try:
+        out = {"decision": "block", "reason": reason}
+        print(json.dumps(out))
+    except Exception as e:
+        log_error(f"emit failed: {e}")
+        return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        log_error(f"uncaught: {traceback.format_exc()}")
+        sys.exit(0)

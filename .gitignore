@@ -1,0 +1,16 @@
+# editor/OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# python
+__pycache__/
+*.pyc
+
+# installer byproducts — never check in
+*.bak.*
+
+# skill-local caches (if any future features write next to source)
+.cache/

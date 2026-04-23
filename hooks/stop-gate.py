@@ -81,6 +81,11 @@ STRICTNESS_DIRECTIVES = {
     "strict":  "You are a strict adversarial completion reviewer. Assume the main agent is cutting corners; your job is to prove it. Do not confirm completion unless every dimension passes unambiguously.",
 }
 
+# Valid enum values for the `model` frontmatter field. `default` / empty /
+# anything else we don't recognize causes the hook to omit the model param
+# so the main agent's Task tool picks the inherited model.
+VALID_REVIEWER_MODELS = {"haiku", "sonnet", "opus"}
+
 # Subcommands of /reflect-and-refine that are query/config — they MUST NOT
 # be treated as activation markers. Only `shutdown` closes the gate;
 # `activate` (or empty args) opens it; anything else listed here is
@@ -91,6 +96,12 @@ IDEMPOTENT_RAR_SUBCOMMANDS = {
 
 
 def log_error(msg: str) -> None:
+    """
+    Write to ~/.reflect-and-refine/logs/errors-YYYYMMDD.log AND emit a
+    one-line stderr hint so the user has a visible signal something went
+    wrong. stderr from a Claude Code Stop hook is shown in the terminal
+    (exit code 2 would block, we use 0 here so it's non-blocking).
+    """
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         logfile = LOG_DIR / f"errors-{datetime.now():%Y%m%d}.log"
@@ -98,6 +109,14 @@ def log_error(msg: str) -> None:
             f.write(f"[{datetime.now().isoformat()}] {msg}\n")
     except Exception:
         pass  # last-resort: don't let logging itself break us
+    try:
+        # Single concise line to stderr; truncate long messages so we never
+        # spam the terminal. Don't include full traceback here — it's in the
+        # log file.
+        head = msg.splitlines()[0][:120] if msg else "unknown"
+        sys.stderr.write(f"[reflect-and-refine] hook error: {head} (see ~/.reflect-and-refine/logs/)\n")
+    except Exception:
+        pass
 
 
 def _head(s: str, n: int = AUDIT_HEAD_MAX) -> str:
@@ -478,6 +497,12 @@ def build_block_reason(request_text: str, agent_text: str, prompt_path: Path) ->
     if strictness not in STRICTNESS_DIRECTIVES:
         strictness = "default"
 
+    model_raw = (fm.get("model") or fm.get("model_preference") or "").strip().lower()
+    if model_raw in VALID_REVIEWER_MODELS:
+        model_preference_param = f"- `model`: `{model_raw}`\n"
+    else:
+        model_preference_param = ""  # "default" / "" / unknown → inherit
+
     dimensions = fm.get("dimensions", [])
     if not isinstance(dimensions, list):
         dimensions = []
@@ -499,6 +524,7 @@ def build_block_reason(request_text: str, agent_text: str, prompt_path: Path) ->
         .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
         .replace("{LANGUAGE}", language)
         .replace("{STRICTNESS_DIRECTIVE}", strictness_directive)
+        .replace("{MODEL_PREFERENCE_PARAM}", model_preference_param)
         .replace("{DIMENSIONS_BLOCK}", dimensions_block)
         .replace("{CUSTOM_CHECKS_BLOCK}", custom_checks_block)
     )

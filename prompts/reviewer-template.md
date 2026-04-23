@@ -15,6 +15,16 @@ language: en
 # each dimension is phrased. Valid: lenient | default | strict
 strictness: default
 
+# Preferred model for the reviewer subagent. When set, the hook adds a
+# `model:` param to the Task call so the main agent invokes the reviewer
+# on that specific model tier.
+# Valid: haiku | sonnet | opus | default (inherit parent session's model)
+# Recommendation:
+#   haiku  — fast + cheap, good for routine completion checks
+#   sonnet — balanced (default for most projects)
+#   opus   — deepest analysis, reserve for high-stakes / architectural reviews
+model: default
+
 # Which built-in review dimensions to include. The hook looks up each name
 # in its internal snippet dict (per strictness) and splices the rendered
 # block into {DIMENSIONS_BLOCK} below. Available dimension names:
@@ -47,7 +57,7 @@ custom_checks: []
 
 Call the Task tool with these parameters:
 - `subagent_type`: `general-purpose`
-- `description`: `Completion reviewer`
+{MODEL_PREFERENCE_PARAM}- `description`: `Completion reviewer`
 - `prompt`: copy the block below between the `---` markers verbatim — the hook has already substituted all placeholders, so no further editing is needed.
 
 ---

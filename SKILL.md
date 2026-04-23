@@ -94,9 +94,12 @@ Stored in `~/.reflect-and-refine/config.json`:
 ```json
 {
   "registered_skills": ["reflect-and-refine"],
-  "max_blocks_per_turn": 3
+  "max_blocks_per_turn": 3,
+  "suppress_output": true
 }
 ```
+
+**`suppress_output`** (default `true`): when true, the injected reviewer prompt dump does NOT render in the terminal — Claude Code shows only a brief "Ran 1 stop hook" summary line (collapsed; press ctrl+o to expand). The main agent still receives the full instructions in its context. Set to `false` if you want to see the full prompt in the terminal for debugging. First-time session banner is also suppressed in quiet mode.
 
 ## Emergency shutdown (without a slash command)
 

@@ -376,8 +376,17 @@ def main() -> None:
         log_error(f"build reason failed: {e}")
         return
 
+    # Quiet terminal by default: suppress the verbose reviewer-prompt dump
+    # from the transcript display. The main agent still receives the full
+    # `reason` in its context — only the user-visible terminal output is
+    # collapsed. User can restore verbose mode by setting
+    # "suppress_output": false in ~/.reflect-and-refine/config.json.
+    suppress_output = bool(config.get("suppress_output", True))
+
     try:
         out = {"decision": "block", "reason": reason}
+        if suppress_output:
+            out["suppressOutput"] = True
         print(json.dumps(out))
         audit_log(
             "BLOCKED",
@@ -386,6 +395,7 @@ def main() -> None:
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": "registered skill invocation in transcript",
                 "banner_shown": "yes (first block this session)" if banner_shown else "no",
+                "suppress_output": "on (quiet)" if suppress_output else "off (verbose)",
                 "user_request_head": _head(request_text),
                 "agent_response_head": _head(agent_text),
                 "agent_response_full_chars": len(agent_text),

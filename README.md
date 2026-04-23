@@ -152,6 +152,7 @@ Events logged: `BLOCKED` (reason was injected), `RATE-LIMITED` (would have block
 
 ## Limitations
 
+- **Quiet by default**: the injected reviewer prompt is sent to the main agent's context but NOT rendered in the terminal (via `suppressOutput`). You'll see Claude Code's brief "Ran 1 stop hook" line instead of a 4000-character wall. To restore verbose terminal output, set `"suppress_output": false` in `~/.reflect-and-refine/config.json`.
 - **Main agent can still try to game the reviewer** by biasing the prompt it constructs. The hook pre-extracts transcript excerpts to reduce this; strong adversarial behavior needs prompt iteration over time.
 - **Reviewer costs tokens per Stop** while the gate is open. If the gate is open all session, every stop triggers a sub-agent call. Budget accordingly.
 - **Requires Claude Code session restart** to load/unload the hook (hooks are session-scope, not hot-reloadable).

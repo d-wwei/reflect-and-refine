@@ -32,8 +32,6 @@ A per-session "gate" decides whether the review fires on a given Stop event.
 
 Query/config subcommands of reflect-and-refine itself are intentionally transparent — running `/reflect-and-refine status` after a `shutdown` keeps the gate closed; running `/reflect-and-refine audit` in the middle of an active session keeps the gate open.
 
-**First-time session banner**: the first time the hook blocks in a session, the injected reason is prefixed with a one-time banner explaining *why* reflect-and-refine is active and *how* to disable it (`/reflect-and-refine shutdown`, `.paused` flag, or `RAR_DISABLED=1`). Tracked via `/tmp/rar-<session>.banner-shown` — self-expires on reboot.
-
 **Rate limit**: within a single user turn, the gate blocks at most `max_blocks_per_turn` times (default 3). After that it allows the stop so you can break out of loops.
 
 There is no time-window expiry by default — activation persists until you explicitly shut it down or start a new session.

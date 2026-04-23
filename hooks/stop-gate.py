@@ -262,36 +262,6 @@ def build_block_reason(request_text: str, agent_text: str) -> str:
               .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
 
 
-SESSION_BANNER = (
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    "REFLECT-AND-REFINE ACTIVE · First review this session.\n"
-    "  Active because: a registered skill was invoked in this session.\n"
-    "  Disable for this session: /reflect-and-refine shutdown\n"
-    "  Persistent disable:       touch ~/.reflect-and-refine/.paused\n"
-    "  Settings:                 /reflect-and-refine status | rate-limit <N>\n"
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-)
-
-
-def maybe_prepend_banner(reason: str, session_id: str) -> tuple[str, bool]:
-    """
-    On the first hook block of a session, prepend a banner so the user sees why
-    reflect-and-refine is active and how to disable it. Tracked via a marker
-    file in /tmp so it self-expires on reboot.
-    Returns (reason_possibly_with_banner, banner_was_shown).
-    """
-    marker = Path(f"/tmp/rar-{session_id or 'unknown'}.banner-shown")
-    if marker.exists():
-        return reason, False
-    try:
-        marker.touch()
-    except Exception as e:
-        log_error(f"banner marker write failed: {e}")
-        # If we can't mark it, showing the banner twice is still acceptable;
-        # proceed to show.
-    return SESSION_BANNER + reason, True
-
-
 def main() -> None:
     # Emergency shutdown (checked BEFORE reading stdin so it's as cheap as
     # possible):
@@ -371,7 +341,6 @@ def main() -> None:
     try:
         request_text, agent_text = last_user_command_parts(records)
         reason = build_block_reason(request_text, agent_text)
-        reason, banner_shown = maybe_prepend_banner(reason, session_id or "unknown")
     except Exception as e:
         log_error(f"build reason failed: {e}")
         return
@@ -394,7 +363,6 @@ def main() -> None:
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": "registered skill invocation in transcript",
-                "banner_shown": "yes (first block this session)" if banner_shown else "no",
                 "suppress_output": "on (quiet)" if suppress_output else "off (verbose)",
                 "user_request_head": _head(request_text),
                 "agent_response_head": _head(agent_text),

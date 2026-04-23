@@ -60,21 +60,39 @@ def read_transcript(path: Path) -> list[dict]:
     return records
 
 
+def is_real_user_record(rec: dict) -> bool:
+    """
+    A 'real' user message is one typed/pasted by the human user, NOT:
+    - hook injections (isMeta: true)
+    - tool results (toolUseResult present)
+    - sidechain / meta records
+    """
+    if rec.get("type") != "user":
+        return False
+    if rec.get("isMeta") is True:
+        return False
+    if rec.get("toolUseResult") is not None:
+        return False
+    content = rec.get("message", {}).get("content", "")
+    if not isinstance(content, str):
+        # tool results often have list content; real user messages are strings
+        return False
+    return True
+
+
 def gate_state(records: list[dict], registered_skills: set[str]) -> str:
     """
-    Scan transcript from newest to oldest. Return 'OPEN' or 'CLOSED'.
+    Scan real user records from newest to oldest. Return 'OPEN' or 'CLOSED'.
     - Last marker is a shutdown for reflect-and-refine -> CLOSED
     - Last marker is an invocation of any registered skill -> OPEN
     - No markers found -> CLOSED
     """
     name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
-    args_pat = re.compile(r"<command-args>([^<]*)</command-args>")
+    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
     for rec in reversed(records):
-        if rec.get("type") != "user":
+        if not is_real_user_record(rec):
             continue
-        content = rec.get("message", {}).get("content", "")
-        if not isinstance(content, str):
-            continue
+        content = rec["message"]["content"]
         m = name_pat.search(content)
         if not m:
             continue
@@ -91,61 +109,65 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> str:
 
 def last_user_timestamp(records: list[dict]) -> str:
     for rec in reversed(records):
-        if rec.get("type") == "user":
+        if is_real_user_record(rec):
             return rec.get("timestamp", "")
     return ""
 
 
 def last_user_command_parts(records: list[dict]) -> tuple[str, str]:
     """
-    Return (request_text, prior_assistant_text) for the most recent 'real' user
-    message (one containing a <command-name> OR a plain text message that is not
-    a hook attachment/system reminder) and the most recent assistant text
-    response BEFORE Stop fired.
+    Return (request_text, agent_response_text).
+
+    request_text: the most recent REAL user message (hook injections and tool
+    results skipped). If slash-command, render as "/skill args"; else plain text.
+
+    agent_response_text: concatenation of ALL assistant text blocks that appear
+    AFTER the most recent real user message. This captures the full response
+    across tool-call boundaries, not just the last text block.
     """
     name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
     args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
 
-    request_text = ""
-    for rec in reversed(records):
-        if rec.get("type") != "user":
-            continue
-        content = rec.get("message", {}).get("content", "")
-        if not isinstance(content, str):
-            continue
-        if "<command-name>" in content:
-            args_match = args_pat.search(content)
-            name_match = name_pat.search(content)
-            if name_match and args_match:
-                request_text = f"/{name_match.group(1)} {args_match.group(1).strip()}"
-            elif name_match:
-                request_text = f"/{name_match.group(1)}"
-            else:
-                request_text = content[:2000]
+    # Find index of last real user record
+    last_user_idx = -1
+    for i in range(len(records) - 1, -1, -1):
+        if is_real_user_record(records[i]):
+            last_user_idx = i
             break
-        if "<system-reminder>" in content or "<hook-" in content:
-            continue
-        request_text = content.strip()[:4000]
-        break
 
-    agent_text = ""
-    for rec in reversed(records):
+    if last_user_idx == -1:
+        return "", ""
+
+    user_rec = records[last_user_idx]
+    content = user_rec["message"]["content"]
+    name_match = name_pat.search(content)
+    args_match = args_pat.search(content)
+    if name_match and args_match:
+        request_text = f"/{name_match.group(1)} {args_match.group(1).strip()}"
+    elif name_match:
+        request_text = f"/{name_match.group(1)}"
+    else:
+        cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", content, flags=re.DOTALL).strip()
+        request_text = cleaned[:4000]
+
+    agent_text_blocks: list[str] = []
+    for rec in records[last_user_idx + 1 :]:
         if rec.get("type") != "assistant":
             continue
         msg = rec.get("message", {})
         content = msg.get("content", "")
         if isinstance(content, list):
-            texts = []
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    texts.append(block.get("text", ""))
-            agent_text = "\n".join(texts).strip()
+                    t = (block.get("text") or "").strip()
+                    if t:
+                        agent_text_blocks.append(t)
         elif isinstance(content, str):
-            agent_text = content.strip()
-        if agent_text:
-            agent_text = agent_text[:8000]
-            break
+            s = content.strip()
+            if s:
+                agent_text_blocks.append(s)
 
+    agent_text = "\n\n".join(agent_text_blocks)[:8000]
     return request_text, agent_text
 
 

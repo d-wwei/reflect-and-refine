@@ -71,6 +71,7 @@ After this, invoking `/better-work`, `/better-code`, or `/better-test` will also
 | `/reflect-and-refine unregister <name> ...` | Remove skills from the registry |
 | `/reflect-and-refine rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
 | `/reflect-and-refine audit [<N>]` | Print last N audit entries (default 5). See `~/.reflect-and-refine/audit.md` for full history. |
+| `/reflect-and-refine customize [<skill>]` | Interactive wizard to tune the reviewer (language, strictness, dimensions, project-specific checks) for one skill or the global default. Writes a structured markdown file with YAML frontmatter + placeholders. |
 
 ## Integration with parent skills
 
@@ -127,11 +128,46 @@ User state:
 
 ```
 ~/.reflect-and-refine/
-├── config.json                # registered_skills, max_blocks_per_turn
+├── config.json                # registered_skills, max_blocks_per_turn, suppress_output, reviewer.per_skill
 ├── audit.md                   # human-readable append-only log of every BLOCKED / RATE-LIMITED event
+├── prompts/
+│   ├── default.md             # user-level default reviewer (seeded on install, hand-editable)
+│   └── overrides/
+│       └── <skill>.md         # per-skill override (created by `/reflect-and-refine customize <skill>`)
 ├── .paused                    # (optional) kill-switch flag file
 └── logs/                      # error logs (hook is fail-open, logs for debugging)
 ```
+
+## Customising the reviewer
+
+Every reviewer prompt is a markdown file with **YAML frontmatter** (structured config) + **body** (free-form prose with placeholders the hook fills at run time). Three ways to customise:
+
+1. **Quickest — frontmatter edit**: open `~/.reflect-and-refine/prompts/default.md`, change `language`, `strictness`, or the `dimensions` list. Takes effect next Stop event (hook rereads on every fire).
+2. **Guided — interactive wizard**: run `/reflect-and-refine customize` (global default) or `/reflect-and-refine customize better-code` (per-skill). The main agent walks you through a 9-step dialog and writes the file for you.
+3. **Power-user — hand-written body**: copy the bundled template, rewrite the role text / verdict schema / post-verdict actions to taste. Placeholders honoured by the hook: `{USER_REQUEST}`, `{AGENT_RESPONSE}`, `{LANGUAGE}`, `{STRICTNESS_DIRECTIVE}`, `{DIMENSIONS_BLOCK}`, `{CUSTOM_CHECKS_BLOCK}`.
+
+### Prompt resolution order (highest priority first)
+
+```
+1. config.reviewer.per_skill.<triggered_skill>  (explicit mapping in config.json)
+2. ~/.reflect-and-refine/prompts/overrides/<triggered_skill>.md
+3. ~/.reflect-and-refine/prompts/default.md     (user-level default)
+4. <install_root>/prompts/reviewer-template.md  (bundled fallback)
+```
+
+### Built-in dimensions
+
+Each can be toggled via the `dimensions` list in frontmatter; the hook renders each name using its internal snippet (one of three strictness variants):
+
+| Name | What it checks |
+|------|---------------|
+| `requirement_split` | Every distinct requirement enumerated? |
+| `evidence` | Concrete artifact (file:line, command output, test result) for each? |
+| `hedging` | "Should work" / "probably" / "likely" / "I believe"? |
+| `silent_drops` | Any requirement dropped or deferred without disclosure? |
+| `fake_evidence` | References to files that don't exist, unrun tests, contradictions? |
+| `consistency` | Internal consistency across the response? |
+| `completeness` | Implicit sub-questions also answered? |
 
 ## Auditability (for humans)
 

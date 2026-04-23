@@ -1,12 +1,59 @@
+---
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║ Reviewer configuration — structured fields.                    ║
+# ║ Edit these to tune the review quickly. See body below for      ║
+# ║ deeper customisation (role, verdict schema, main-agent steps). ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+# Output language the reviewer should use. The value is injected verbatim
+# into the reviewer prompt as a directive. Free text; common values: "zh"
+# (will render as Chinese), "en" (English), or any phrase like "Chinese,
+# keep technical terms in English".
+language: en
+
+# How strict the reviewer should be. Affects the opening directive and how
+# each dimension is phrased. Valid: lenient | default | strict
+strictness: default
+
+# Which built-in review dimensions to include. The hook looks up each name
+# in its internal snippet dict (per strictness) and splices the rendered
+# block into {DIMENSIONS_BLOCK} below. Available dimension names:
+#   evidence           — does every requirement have concrete evidence?
+#   hedging            — flag "should", "probably", etc.
+#   silent_drops       — any silently dropped / deferred requirement?
+#   fake_evidence      — references to files that don't exist, unrun tests
+#   requirement_split  — enumerate every distinct requirement
+#   consistency        — is the response internally consistent?
+#   completeness       — are implicit sub-questions answered?
+dimensions:
+  - requirement_split
+  - evidence
+  - hedging
+  - silent_drops
+  - fake_evidence
+
+# Extra project-specific checks. Each entry becomes a bullet under the
+# "Project-specific checks" section in the reviewer prompt. Leave empty
+# when not needed.
+custom_checks: []
+# custom_checks:
+#   - name: security_review
+#     description: Check for common security issues (SQL injection, XSS, permission leaks).
+#   - name: test_coverage
+#     description: Verify tests exist for files that were modified.
+---
+
 [REFLECT-AND-REFINE] Completion review required before stop.
 
 Call the Task tool with these parameters:
 - `subagent_type`: `general-purpose`
 - `description`: `Completion reviewer`
-- `prompt`: copy the block below between the `---` markers verbatim — the hook has already filled in the user request and agent response, so no further substitution is needed.
+- `prompt`: copy the block below between the `---` markers verbatim — the hook has already substituted all placeholders, so no further editing is needed.
 
 ---
-You are an adversarial completion reviewer. Your job is to find gaps in the main agent's work. Do not confirm completion unless you cannot find a single gap worth flagging.
+{STRICTNESS_DIRECTIVE}
+
+Respond in: {LANGUAGE}.
 
 USER'S ORIGINAL REQUEST:
 {USER_REQUEST}
@@ -15,11 +62,9 @@ AGENT'S MOST RECENT RESPONSE:
 {AGENT_RESPONSE}
 
 Check these dimensions:
-1. Is every distinct requirement in the user's request enumerated?
-2. Does each requirement have concrete evidence of completion — file:line reference, command output, test result, or observable state change? "I did X" without artifact is NOT evidence.
-3. Any hedging ("should work", "probably", "likely", "I believe")? Flag as insufficient.
-4. Any requirement silently dropped, deferred, or glossed over?
-5. Any evidence that looks fabricated — references to nonexistent files, test results without the command that produced them, internal contradictions?
+{DIMENSIONS_BLOCK}
+
+{CUSTOM_CHECKS_BLOCK}
 
 Return ONLY this JSON (no prose before or after, no code fencing):
 {"verdict":"approved"|"incomplete"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}

@@ -116,10 +116,19 @@ jq -e . "$TMP_FILE" >/dev/null 2>&1 || { rm -f "$TMP_FILE"; die "merge produced 
 mv "$TMP_FILE" "$SETTINGS_FILE"
 echo "hook installed in: $SETTINGS_FILE"
 
-# Config file
-mkdir -p "$CONFIG_DIR"
+# Config file + prompts scaffolding
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides"
 if [ ! -f "$CONFIG_FILE" ]; then
-  echo '{"registered_skills":["reflect-and-refine"],"max_blocks_per_turn":3}' > "$CONFIG_FILE"
+  echo '{"registered_skills":["reflect-and-refine"],"max_blocks_per_turn":3,"suppress_output":true,"reviewer":{"per_skill":{}}}' > "$CONFIG_FILE"
+fi
+
+# Seed user-level default prompt so it's visible and editable in-place.
+# Users can modify this file or run `/reflect-and-refine customize` (no skill
+# arg) to regenerate its frontmatter.
+USER_DEFAULT="$CONFIG_DIR/prompts/default.md"
+if [ ! -f "$USER_DEFAULT" ]; then
+  cp "$SKILL_ROOT/prompts/reviewer-template.md" "$USER_DEFAULT"
+  echo "seeded user-level default prompt: $USER_DEFAULT"
 fi
 
 # Register additional skills if requested

@@ -71,6 +71,52 @@ Print the last N audit entries from `~/.reflect-and-refine/audit.md` (default N=
 
 If no audit file exists, say so (means the hook has never fired, or was always paused/closed).
 
+### `/reflect-and-refine customize [<skill>]`
+
+Interactive wizard to create or edit a per-skill reviewer prompt override. Generates a structured markdown file (YAML frontmatter + body placeholders) the hook will route to when the named skill triggers the gate.
+
+**Where the file lands**:
+- `<skill>` given → `~/.reflect-and-refine/prompts/overrides/<skill>.md`, plus a routing entry added to `config.json` → `reviewer.per_skill.<skill>`.
+- `<skill>` omitted → edit the global default at `~/.reflect-and-refine/prompts/default.md` (used when no per-skill override exists).
+
+**Dialog flow** (main agent asks each question, collects the answer, generates the file at the end):
+
+1. **Target skill** — if no arg given, ask: "Edit the global default, or override for a specific skill? Enter a skill name or 'default'."
+2. **Language** — "Response language for the reviewer? (en / zh / free text like 'Chinese, keep code identifiers in English')"
+3. **Strictness** — offer three:
+   - `lenient` — only serious gaps are flagged
+   - `default` — standard completion review (recommended)
+   - `strict` — assume the agent is cutting corners; prove it
+4. **Built-in dimensions** — multi-select from:
+   - `requirement_split` — enumerate every distinct requirement
+   - `evidence` — each requirement must have concrete artifact
+   - `hedging` — flag "should"/"probably"/"likely"
+   - `silent_drops` — requirement silently dropped or deferred
+   - `fake_evidence` — references to nonexistent files / unrun tests
+   - `consistency` — internal consistency of the response
+   - `completeness` — implicit sub-questions also answered
+
+   Defaults to the first 5. Agent should list them with checkboxes and let the user toggle.
+5. **Custom checks** — "Any project-specific checks? (leave empty to skip). For each, provide a short `name` and `description`."
+6. **Preview** — show the agent the assembled YAML frontmatter before writing:
+   ```yaml
+   language: ...
+   strictness: ...
+   dimensions: [...]
+   custom_checks: [...]
+   ```
+   User confirms.
+7. **Write** — main agent writes the file:
+   - Frontmatter as captured above
+   - Body copied from the bundled template at `<skill-install-root>/prompts/reviewer-template.md` (so placeholders like `{USER_REQUEST}` etc. are preserved). If the file already exists, confirm overwrite first.
+8. **Routing** — if target was a specific skill:
+   - Read `~/.reflect-and-refine/config.json`
+   - jq-merge `.reviewer.per_skill.<skill>` = `"prompts/overrides/<skill>.md"`
+   - Write back, preserving unknown fields
+9. **Confirm** — print the final path, say "Active on next `/<skill>` invocation in a new Claude Code session (or immediately — the hook rereads config on every Stop)."
+
+**Note**: the user may want to keep editing the generated file by hand. Print the path clearly. The wizard only captures the frontmatter; body changes (custom role text, modified verdict schema) require direct editing.
+
 ### `/reflect-and-refine rate-limit [<N>] [--force]`
 Get or set `max_blocks_per_turn` — how many times the hook may block consecutively within one user turn before giving up and allowing the stop.
 

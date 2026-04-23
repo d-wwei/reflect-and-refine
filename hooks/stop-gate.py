@@ -24,18 +24,70 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 PAUSE_FLAG = CONFIG_DIR / ".paused"
 LOG_DIR = CONFIG_DIR / "logs"
 AUDIT_LOG = CONFIG_DIR / "audit.md"
+USER_PROMPTS_DIR = CONFIG_DIR / "prompts"
+USER_OVERRIDES_DIR = USER_PROMPTS_DIR / "overrides"
+USER_DEFAULT_PROMPT = USER_PROMPTS_DIR / "default.md"
 SKILL_ROOT = Path(__file__).resolve().parent.parent
-PROMPT_TEMPLATE = SKILL_ROOT / "prompts" / "reviewer-template.md"
+BUNDLED_PROMPT = SKILL_ROOT / "prompts" / "reviewer-template.md"
 
 SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
 AUDIT_HEAD_MAX = 150  # chars to show in audit excerpts
 
+# Dimension snippets: {dimension_name: {strictness: text}}. Rendered into the
+# {DIMENSIONS_BLOCK} slot based on frontmatter config. Keep each snippet to
+# one numbered line so the assembled block reads as an ordered list.
+DIMENSION_SNIPPETS = {
+    "requirement_split": {
+        "lenient": "Is every major requirement in the user's request identified?",
+        "default": "Is every distinct requirement in the user's request enumerated?",
+        "strict":  "Enumerate every distinct requirement in the user's request, splitting multi-part asks into discrete items. Missing one = fail.",
+    },
+    "evidence": {
+        "lenient": "Does each requirement have some supporting evidence (even if partial)?",
+        "default": "Does each requirement have concrete evidence of completion — file:line, command output, test result, or observable state change? \"I did X\" without artifact is NOT evidence.",
+        "strict":  "Every requirement MUST cite one of: file:line reference, verbatim command output, actual test pass line, or directly observable state change. Narrative claims without artifact are failures.",
+    },
+    "hedging": {
+        "lenient": "Flag outright uncertain language (\"unsure\", \"might not work\").",
+        "default": "Any hedging (\"should work\", \"probably\", \"likely\", \"I believe\")? Flag as insufficient.",
+        "strict":  "Any hedging at all (\"should\", \"probably\", \"likely\", \"I believe\", \"pretty sure\", \"I think\")? Automatic insufficient-evidence flag.",
+    },
+    "silent_drops": {
+        "lenient": "Any obviously ignored requirement?",
+        "default": "Any requirement silently dropped, deferred, or glossed over?",
+        "strict":  "Any requirement the agent did not explicitly address — even a trivial \"skipped because X\" disclosure? Silence is a failure.",
+    },
+    "fake_evidence": {
+        "lenient": "Any clearly fabricated claim (e.g., file path that obviously doesn't exist)?",
+        "default": "Any evidence that looks fabricated — references to nonexistent files, test results without the command that produced them, internal contradictions?",
+        "strict":  "Verify that every cited file path, command output, and test result is internally consistent with the response. Any unverified reference is potentially fabricated.",
+    },
+    "consistency": {
+        "lenient": "Are the claims internally consistent?",
+        "default": "Is the response internally consistent — no claims that contradict each other?",
+        "strict":  "Cross-check every factual claim against every other claim. Flag any tension, even minor.",
+    },
+    "completeness": {
+        "lenient": "Are the explicit user questions answered?",
+        "default": "Are all explicit AND implicit sub-questions answered?",
+        "strict":  "Answer ALL explicit questions, ALL implicit sub-questions, AND note any latent questions the user didn't think to ask but should care about.",
+    },
+}
+
+STRICTNESS_DIRECTIVES = {
+    "lenient": "You are a completion reviewer. Flag only serious gaps. Minor omissions may be acceptable.",
+    "default": "You are an adversarial completion reviewer. Your job is to find gaps in the main agent's work. Do not confirm completion unless you cannot find a single gap worth flagging.",
+    "strict":  "You are a strict adversarial completion reviewer. Assume the main agent is cutting corners; your job is to prove it. Do not confirm completion unless every dimension passes unambiguously.",
+}
+
 # Subcommands of /reflect-and-refine that are query/config — they MUST NOT
 # be treated as activation markers. Only `shutdown` closes the gate;
 # `activate` (or empty args) opens it; anything else listed here is
 # transparent to gate state.
-IDEMPOTENT_RAR_SUBCOMMANDS = {"status", "audit", "rate-limit", "register", "unregister"}
+IDEMPOTENT_RAR_SUBCOMMANDS = {
+    "status", "audit", "rate-limit", "register", "unregister", "customize",
+}
 
 
 def log_error(msg: str) -> None:
@@ -122,15 +174,18 @@ def is_real_user_record(rec: dict) -> bool:
     return True
 
 
-def gate_state(records: list[dict], registered_skills: set[str]) -> str:
+def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, str]:
     """
-    Scan real user records from newest to oldest. Return 'OPEN' or 'CLOSED'.
+    Scan real user records from newest to oldest. Return (state, triggered_skill).
+    - state: 'OPEN' or 'CLOSED'
+    - triggered_skill: the skill name that caused the OPEN state, or "" if CLOSED.
+      Used downstream for per-skill prompt routing.
 
     Rules (last matching real-user command wins; query subcommands are transparent):
     - /reflect-and-refine shutdown              -> CLOSED
-    - /reflect-and-refine activate | (no args)  -> OPEN
+    - /reflect-and-refine activate | (no args)  -> OPEN, triggered_skill="reflect-and-refine"
     - /reflect-and-refine <idempotent-query>    -> skip (doesn't change state)
-    - /<any-other-registered-skill>             -> OPEN
+    - /<any-other-registered-skill>             -> OPEN, triggered_skill=<skill>
     - no markers found                          -> CLOSED
     """
     name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
@@ -149,15 +204,162 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> str:
         if skill == "reflect-and-refine":
             first_arg = args.split()[0] if args else ""
             if first_arg == SHUTDOWN_MARKER_ARGS:
-                return "CLOSED"
+                return "CLOSED", ""
+            if first_arg == "" or first_arg == "activate":
+                return "OPEN", "reflect-and-refine"
             if first_arg in IDEMPOTENT_RAR_SUBCOMMANDS:
                 continue  # query/config — transparent to gate state
-            # activate, empty, or unknown subcommand -> fail-safe OPEN
-            return "OPEN"
+            # Unknown subcommand (typo, new command we don't recognize): be
+            # transparent rather than fail-safe-activate.
+            continue
 
         if skill in registered_skills:
-            return "OPEN"
-    return "CLOSED"
+            return "OPEN", skill
+    return "CLOSED", ""
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """
+    Minimal YAML frontmatter parser (stdlib-only). Supports:
+    - scalar fields: key: value
+    - list fields:   key: \n  - item1 \n  - item2
+    - list of dicts: key: \n  - name: foo \n    description: bar
+    - comments: lines starting with #
+    - empty lists: key: []
+    Does NOT support nested maps, multi-line strings, flow-style syntax.
+
+    Returns (config_dict, body_text). If no frontmatter, config_dict is {}.
+    """
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    fm_lines: list[str] = []
+    body_start = len(lines)
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            body_start = i + 1
+            break
+        fm_lines.append(lines[i])
+
+    config: dict = {}
+    current_key: str | None = None
+    current_list: list | None = None
+    current_dict: dict | None = None
+
+    for raw in fm_lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # List item
+        if stripped.startswith("- "):
+            item_text = stripped[2:].strip()
+            if current_list is None:
+                continue  # malformed, skip
+            # List of dicts: "- key: value"
+            if ":" in item_text and not item_text.startswith('"'):
+                k, _, v = item_text.partition(":")
+                current_dict = {k.strip(): v.strip().strip('"').strip("'")}
+                current_list.append(current_dict)
+            else:
+                current_list.append(item_text.strip('"').strip("'"))
+                current_dict = None
+            continue
+
+        # Continuation of a dict list item: "  key: value" (indented)
+        if raw.startswith("    ") and current_dict is not None and ":" in raw:
+            k, _, v = raw.strip().partition(":")
+            current_dict[k.strip()] = v.strip().strip('"').strip("'")
+            continue
+
+        # New top-level key
+        if ":" in raw and not raw.startswith((" ", "\t")):
+            k, _, v = raw.partition(":")
+            k = k.strip()
+            v = v.strip()
+            if v == "" or v == "|":
+                # Following lines will be a list (or indented scalar — not supported)
+                current_key = k
+                current_list = []
+                config[k] = current_list
+                current_dict = None
+            elif v == "[]":
+                config[k] = []
+                current_key = k
+                current_list = None
+                current_dict = None
+            else:
+                config[k] = v.strip('"').strip("'")
+                current_key = k
+                current_list = None
+                current_dict = None
+
+    body = "\n".join(lines[body_start:])
+    return config, body
+
+
+def assemble_dimensions_block(dimension_names: list[str], strictness: str) -> str:
+    """Render selected dimension snippets as a numbered list."""
+    if not dimension_names:
+        return "(no dimensions configured)"
+    out = []
+    for i, name in enumerate(dimension_names, 1):
+        snippets = DIMENSION_SNIPPETS.get(name)
+        if snippets is None:
+            out.append(f"{i}. ({name} — unknown dimension; hook did not render)")
+            continue
+        text = snippets.get(strictness) or snippets.get("default") or ""
+        out.append(f"{i}. {text}")
+    return "\n".join(out)
+
+
+def assemble_custom_checks_block(custom_checks: list) -> str:
+    if not custom_checks:
+        return ""
+    lines = ["Project-specific checks:"]
+    for check in custom_checks:
+        if isinstance(check, dict):
+            name = check.get("name", "unnamed")
+            desc = check.get("description", "")
+            lines.append(f"- **{name}**: {desc}")
+        elif isinstance(check, str):
+            lines.append(f"- {check}")
+    return "\n".join(lines)
+
+
+def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
+    """
+    Three-layer fallback (highest precedence first):
+      1. Explicit per-skill path in config.reviewer.per_skill.<skill>
+      2. ~/.reflect-and-refine/prompts/overrides/<triggered_skill>.md
+      3. ~/.reflect-and-refine/prompts/default.md (user-writable)
+      4. <bundled>/prompts/reviewer-template.md (ships with skill)
+    """
+    reviewer_cfg = config.get("reviewer", {}) if isinstance(config.get("reviewer"), dict) else {}
+    per_skill = reviewer_cfg.get("per_skill", {}) if isinstance(reviewer_cfg.get("per_skill"), dict) else {}
+
+    # Layer 1: explicit config mapping
+    mapped = per_skill.get(triggered_skill) if triggered_skill else None
+    if mapped:
+        mapped_path = Path(os.path.expanduser(str(mapped)))
+        if not mapped_path.is_absolute():
+            mapped_path = CONFIG_DIR / mapped_path
+        if mapped_path.exists():
+            return mapped_path
+
+    # Layer 2: overrides directory, by skill name
+    if triggered_skill:
+        override = USER_OVERRIDES_DIR / f"{triggered_skill}.md"
+        if override.exists():
+            return override
+
+    # Layer 3: user-level default
+    if USER_DEFAULT_PROMPT.exists():
+        return USER_DEFAULT_PROMPT
+
+    # Layer 4: bundled (always exists in a valid install)
+    return BUNDLED_PROMPT
 
 
 def last_user_timestamp(records: list[dict]) -> str:
@@ -256,10 +458,50 @@ def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bo
     return True
 
 
-def build_block_reason(request_text: str, agent_text: str) -> str:
-    tpl = PROMPT_TEMPLATE.read_text()
-    return tpl.replace("{USER_REQUEST}", request_text or "(transcript did not yield a clear user request — review based on the full transcript)") \
-              .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
+def build_block_reason(request_text: str, agent_text: str, prompt_path: Path) -> str:
+    """
+    Read the prompt file at prompt_path, parse its YAML frontmatter for
+    reviewer config (language, strictness, dimensions, custom_checks), and
+    substitute all placeholders in the body:
+        {USER_REQUEST}, {AGENT_RESPONSE},
+        {LANGUAGE}, {STRICTNESS_DIRECTIVE},
+        {DIMENSIONS_BLOCK}, {CUSTOM_CHECKS_BLOCK}
+
+    Templates without frontmatter (legacy or user-edited without YAML) still
+    work — sane defaults fill in for missing fields.
+    """
+    full = prompt_path.read_text()
+    fm, body = parse_frontmatter(full)
+
+    language = fm.get("language", "en") or "en"
+    strictness = fm.get("strictness", "default") or "default"
+    if strictness not in STRICTNESS_DIRECTIVES:
+        strictness = "default"
+
+    dimensions = fm.get("dimensions", [])
+    if not isinstance(dimensions, list):
+        dimensions = []
+    # Default dimensions when none specified
+    if not dimensions:
+        dimensions = ["requirement_split", "evidence", "hedging", "silent_drops", "fake_evidence"]
+
+    custom_checks = fm.get("custom_checks", [])
+    if not isinstance(custom_checks, list):
+        custom_checks = []
+
+    strictness_directive = STRICTNESS_DIRECTIVES.get(strictness, STRICTNESS_DIRECTIVES["default"])
+    dimensions_block = assemble_dimensions_block(dimensions, strictness)
+    custom_checks_block = assemble_custom_checks_block(custom_checks)
+
+    return (
+        body
+        .replace("{USER_REQUEST}", request_text or "(transcript did not yield a clear user request — review based on the full transcript)")
+        .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
+        .replace("{LANGUAGE}", language)
+        .replace("{STRICTNESS_DIRECTIVE}", strictness_directive)
+        .replace("{DIMENSIONS_BLOCK}", dimensions_block)
+        .replace("{CUSTOM_CHECKS_BLOCK}", custom_checks_block)
+    )
 
 
 def main() -> None:
@@ -306,7 +548,7 @@ def main() -> None:
         return
 
     try:
-        state = gate_state(records, registered)
+        state, triggered_skill = gate_state(records, registered)
     except Exception as e:
         log_error(f"gate_state failed: {e}")
         return
@@ -340,7 +582,8 @@ def main() -> None:
 
     try:
         request_text, agent_text = last_user_command_parts(records)
-        reason = build_block_reason(request_text, agent_text)
+        prompt_path = resolve_prompt_path(triggered_skill, config)
+        reason = build_block_reason(request_text, agent_text, prompt_path)
     except Exception as e:
         log_error(f"build reason failed: {e}")
         return
@@ -362,7 +605,8 @@ def main() -> None:
             session_id,
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
-                "gate_trigger": "registered skill invocation in transcript",
+                "gate_trigger": f"/{triggered_skill} in transcript",
+                "prompt_source": str(prompt_path).replace(str(HOME), "~"),
                 "suppress_output": "on (quiet)" if suppress_output else "off (verbose)",
                 "user_request_head": _head(request_text),
                 "agent_response_head": _head(agent_text),

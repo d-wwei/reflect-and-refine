@@ -41,13 +41,15 @@ Close the gate for the remainder of the session. Emits a shutdown marker. Can be
 invoking any registered skill again (including `/reflect-and-refine activate`).
 
 ### `/reflect-and-refine status`
-Show the current gate state, registered skills, and per-turn block count.
+Show the current gate state, registered skills, per-turn block count, and whether any kill switch is active.
 
 When invoked, read `~/.reflect-and-refine/config.json` and report:
 - Registered skills
 - `max_blocks_per_turn` setting
 - Current turn's block count (from `/tmp/rar-<session-id>.state` if present)
 - Last OPEN/CLOSED marker detected in this session's transcript
+- Whether `~/.reflect-and-refine/.paused` exists (kill switch #1 active)
+- Whether `RAR_DISABLED` env var is set on the Claude Code process (kill switch #2 active — inspect via the transcript's env info if available, else state it's unverifiable from the agent)
 
 ### `/reflect-and-refine register <skill-name> [<skill-name> ...]`
 Append one or more skill names to the registered list in `~/.reflect-and-refine/config.json`.
@@ -57,6 +59,20 @@ When invoked: read config, append names (de-duplicated), write back. Preserve un
 
 ### `/reflect-and-refine unregister <skill-name> [<skill-name> ...]`
 Remove skill names from the registered list.
+
+### `/reflect-and-refine rate-limit [<N>] [--force]`
+Get or set `max_blocks_per_turn` — how many times the hook may block consecutively within one user turn before giving up and allowing the stop.
+
+- **No argument** → print the current value.
+- **Positive integer N** → set to N, with the following validation:
+  - `N == 0` or negative → reject with message: "use `touch ~/.reflect-and-refine/.paused` to disable; rate-limit sets strictness, not on/off."
+  - `1 ≤ N ≤ 5` → accept silently.
+  - `6 ≤ N ≤ 20` → accept **with warning**: "heads-up: with max_blocks_per_turn=<N>, a single user turn may contain up to <N> reviewer rounds, which will take longer and cost more tokens."
+  - `N > 20` or non-integer → reject **unless `--force` is also passed**. With `--force`, accept regardless (still warn if feasible).
+
+When invoked: read config, validate per above, write `max_blocks_per_turn` with jq-style merge (preserve `registered_skills` and any unknown fields), report new value and any warning.
+
+Change takes effect immediately — the hook re-reads config.json on every Stop event, so no restart or new session needed.
 
 ## Configuration
 

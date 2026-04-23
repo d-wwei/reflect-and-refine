@@ -69,6 +69,7 @@ After this, invoking `/better-work`, `/better-code`, or `/better-test` will also
 | `/reflect-and-refine status` | Show registry, rate limit, current turn block count |
 | `/reflect-and-refine register <name> ...` | Append skills to the registry |
 | `/reflect-and-refine unregister <name> ...` | Remove skills from the registry |
+| `/reflect-and-refine rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
 
 ## Integration with parent skills
 

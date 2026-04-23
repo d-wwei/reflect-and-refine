@@ -7,7 +7,7 @@ description: |
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
   protocols. Works standalone; integrates loosely with any parent skill via registration.
-  Subcommands: status, shutdown, activate, register, unregister.
+  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize.
 ---
 
 # Reflect and Refine

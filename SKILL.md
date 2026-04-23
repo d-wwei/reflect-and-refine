@@ -20,15 +20,23 @@ the user's request and the agent's response, and must return a structured verdic
 
 A per-session "gate" decides whether the review fires on a given Stop event.
 
-- **Gate OPEN** when the most recent slash-command invocation in the transcript is a *registered*
-  skill (the default registry contains only `reflect-and-refine` itself; parent skills add themselves).
-- **Gate CLOSED** when the most recent slash-command invocation is `/reflect-and-refine shutdown`,
-  or when no registered invocation is found in the transcript.
-- **Rate limit**: within a single user turn, the gate blocks at most 3 times (configurable). After
-  that it allows the stop so you can break out of loops.
+**Which commands change gate state** (last one wins; query subcommands are transparent):
 
-There is no time-window expiry by default — activation persists until you explicitly shut it down
-or start a new session.
+| Command | Effect |
+|---------|--------|
+| `/reflect-and-refine shutdown` | CLOSE |
+| `/reflect-and-refine activate` (or empty args) | OPEN |
+| `/reflect-and-refine status` / `audit` / `rate-limit` / `register` / `unregister` | **transparent** — gate state unchanged |
+| `/<any-registered-parent-skill>` (e.g. `/better-work`, `/better-code`, `/better-test`) | OPEN |
+| no command markers in transcript | CLOSED |
+
+Query/config subcommands of reflect-and-refine itself are intentionally transparent — running `/reflect-and-refine status` after a `shutdown` keeps the gate closed; running `/reflect-and-refine audit` in the middle of an active session keeps the gate open.
+
+**First-time session banner**: the first time the hook blocks in a session, the injected reason is prefixed with a one-time banner explaining *why* reflect-and-refine is active and *how* to disable it (`/reflect-and-refine shutdown`, `.paused` flag, or `RAR_DISABLED=1`). Tracked via `/tmp/rar-<session>.banner-shown` — self-expires on reboot.
+
+**Rate limit**: within a single user turn, the gate blocks at most `max_blocks_per_turn` times (default 3). After that it allows the stop so you can break out of loops.
+
+There is no time-window expiry by default — activation persists until you explicitly shut it down or start a new session.
 
 ## Subcommands
 

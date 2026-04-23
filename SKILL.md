@@ -7,7 +7,7 @@ description: |
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
   protocols. Works standalone; integrates loosely with any parent skill via registration.
-  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize.
+  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin.
 ---
 
 # Reflect and Refine
@@ -26,9 +26,11 @@ A per-session "gate" decides whether the review fires on a given Stop event.
 |---------|--------|
 | `/reflect-and-refine shutdown` | CLOSE |
 | `/reflect-and-refine activate` (or empty args) | OPEN |
-| `/reflect-and-refine status` / `audit` / `rate-limit` / `register` / `unregister` | **transparent** — gate state unchanged |
+| `/reflect-and-refine status` / `audit` / `rate-limit` / `register` / `unregister` / `customize` / `pin` / `unpin` | **transparent** — gate state unchanged |
 | `/<any-registered-parent-skill>` (e.g. `/better-work`, `/better-code`, `/better-test`) | OPEN |
 | no command markers in transcript | CLOSED |
+
+**Pin filter** (applied after gate-state decision): if a `/reflect-and-refine pin <skill>` directive is active, the hook fires only when the triggering skill equals `<skill>`. Other registered skills still appear in the transcript but are silently skipped. `/reflect-and-refine unpin` clears the filter.
 
 Query/config subcommands of reflect-and-refine itself are intentionally transparent — running `/reflect-and-refine status` after a `shutdown` keeps the gate closed; running `/reflect-and-refine audit` in the middle of an active session keeps the gate open.
 
@@ -45,6 +47,16 @@ the invocation itself leaves a marker in the transcript that the hook recognizes
 ### `/reflect-and-refine shutdown`
 Close the gate for the remainder of the session. Emits a shutdown marker. Can be reopened by
 invoking any registered skill again (including `/reflect-and-refine activate`).
+
+### `/reflect-and-refine pin <skill>`
+Scope the gate to **only this skill** for the remainder of the session. When pinned, invocations of other registered skills do NOT open the gate — only `<skill>` does.
+
+Use case: "I'm running `/better-test` for a while, and I want reflect-and-refine to audit only those stops, not any side `/better-code` work I happen to do in the same session."
+
+Implementation: writes a pin marker in the transcript. The hook scans for pin/unpin directives separately from gate activation — pin by itself does not open the gate; the skill you pinned to must still be invoked normally to trigger.
+
+### `/reflect-and-refine unpin`
+Clear any active pin — the gate will again activate for any registered skill. Emits an unpin marker; last pin/unpin directive in the transcript wins.
 
 ### `/reflect-and-refine status`
 Show the current gate state, registered skills, per-turn block count, and whether any kill switch is active.

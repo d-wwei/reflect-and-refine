@@ -17,6 +17,7 @@ import sys
 import traceback
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 
 HOME = Path(os.path.expanduser("~"))
 CONFIG_DIR = HOME / ".reflect-and-refine"
@@ -92,6 +93,9 @@ VALID_REVIEWER_MODELS = {"haiku", "sonnet", "opus"}
 # transparent to gate state.
 IDEMPOTENT_RAR_SUBCOMMANDS = {
     "status", "audit", "rate-limit", "register", "unregister", "customize",
+    # pin/unpin affect WHICH skill activates but don't themselves open/close
+    # the gate — they're directives scanned separately by find_pinned_skill.
+    "pin", "unpin",
 }
 
 
@@ -381,6 +385,39 @@ def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
     return BUNDLED_PROMPT
 
 
+def find_pinned_skill(records: list) -> Optional[str]:
+    """
+    Scan real user records newest-first for the most recent pin/unpin directive.
+    Returns the pinned skill name, or None if unpinned / no directive found.
+
+    - /reflect-and-refine pin <skill>  → returns <skill>
+    - /reflect-and-refine unpin        → returns None (explicitly clears)
+    - no pin/unpin found               → returns None (default: no pin)
+
+    Last directive wins; subsequent pin replaces earlier pin; unpin clears.
+    """
+    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
+    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
+    for rec in reversed(records):
+        if not is_real_user_record(rec):
+            continue
+        content = rec["message"]["content"]
+        m = name_pat.search(content)
+        if not m or m.group(1) != "reflect-and-refine":
+            continue
+        args_m = args_pat.search(content)
+        args = (args_m.group(1).strip() if args_m else "")
+        parts = args.split(maxsplit=1)
+        if not parts:
+            continue
+        verb = parts[0]
+        if verb == "unpin":
+            return None
+        if verb == "pin" and len(parts) == 2:
+            return parts[1].strip()
+    return None
+
+
 def last_user_timestamp(records: list[dict]) -> str:
     for rec in reversed(records):
         if is_real_user_record(rec):
@@ -582,6 +619,16 @@ def main() -> None:
     if state != "OPEN":
         return
 
+    # Pin filter: if user pinned the gate to a specific skill, skip unless
+    # the currently-triggering skill matches.
+    try:
+        pinned_skill = find_pinned_skill(records)
+    except Exception as e:
+        log_error(f"find_pinned_skill failed: {e}")
+        pinned_skill = None
+    if pinned_skill and triggered_skill != pinned_skill:
+        return
+
     max_blocks = int(config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN))
     last_ts = last_user_timestamp(records)
     state_file = Path(f"/tmp/rar-{session_id or 'unknown'}.state")
@@ -632,6 +679,7 @@ def main() -> None:
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": f"/{triggered_skill} in transcript",
+                "pinned_to": pinned_skill or "(no pin — all registered skills)",
                 "prompt_source": str(prompt_path).replace(str(HOME), "~"),
                 "suppress_output": "on (quiet)" if suppress_output else "off (verbose)",
                 "user_request_head": _head(request_text),

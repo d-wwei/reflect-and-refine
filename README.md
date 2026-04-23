@@ -82,6 +82,24 @@ fi
 
 `reflect-and-refine` does not know about `better-work`; parents register themselves.
 
+## Emergency shutdown (from any shell)
+
+If the `/reflect-and-refine` slash command isn't available (e.g. you installed mid-session and the current Claude Code session can't see new skills), you still have two kill switches that work from outside Claude Code:
+
+```bash
+# Pause the hook (file-based kill switch — hook checks before any work)
+touch ~/.reflect-and-refine/.paused
+# Resume
+rm ~/.reflect-and-refine/.paused
+```
+
+```bash
+# Per-launch override (env var — set before launching claude)
+RAR_DISABLED=1 claude
+```
+
+Both are checked at the top of the hook script before transcript or config is read, so the override is cheap.
+
 ## Uninstall
 
 ```bash

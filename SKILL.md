@@ -69,6 +69,22 @@ Stored in `~/.reflect-and-refine/config.json`:
 }
 ```
 
+## Emergency shutdown (without a slash command)
+
+If you're in a Claude Code session that was started BEFORE `reflect-and-refine` was installed, the `/reflect-and-refine` slash command isn't registered and `/reflect-and-refine shutdown` won't work. Two escape hatches work from any shell:
+
+1. **Pause flag file** — the hook checks for `~/.reflect-and-refine/.paused` before doing any work. If present, it exits silently:
+   ```bash
+   touch ~/.reflect-and-refine/.paused     # pause
+   rm    ~/.reflect-and-refine/.paused     # resume
+   ```
+2. **Env var on Claude Code's process** — set `RAR_DISABLED=1` before launching `claude`:
+   ```bash
+   RAR_DISABLED=1 claude
+   ```
+
+Both are checked at the very top of the hook script, so the override is essentially free (no transcript read, no config parse).
+
 ## Install / uninstall
 
 See `install.sh` and `uninstall.sh` in the skill root. The installer writes the Stop hook entry

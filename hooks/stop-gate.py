@@ -21,6 +21,7 @@ from datetime import datetime
 HOME = Path(os.path.expanduser("~"))
 CONFIG_DIR = HOME / ".reflect-and-refine"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+PAUSE_FLAG = CONFIG_DIR / ".paused"
 LOG_DIR = CONFIG_DIR / "logs"
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_TEMPLATE = SKILL_ROOT / "prompts" / "reviewer-template.md"
@@ -210,6 +211,18 @@ def build_block_reason(request_text: str, agent_text: str) -> str:
 
 
 def main() -> None:
+    # Emergency shutdown (checked BEFORE reading stdin so it's as cheap as
+    # possible):
+    # 1. RAR_DISABLED env var non-empty  -> silent exit.
+    # 2. ~/.reflect-and-refine/.paused file exists -> silent exit.
+    # Both exist so users can disable the hook from outside Claude Code
+    # (e.g. from an old session that predates skill install, where the
+    # /reflect-and-refine shutdown slash command isn't registered).
+    if os.environ.get("RAR_DISABLED"):
+        return
+    if PAUSE_FLAG.exists():
+        return
+
     try:
         raw = sys.stdin.read()
         if not raw.strip():

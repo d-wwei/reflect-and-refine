@@ -70,6 +70,7 @@ After this, invoking `/better-work`, `/better-code`, or `/better-test` will also
 | `/reflect-and-refine register <name> ...` | Append skills to the registry |
 | `/reflect-and-refine unregister <name> ...` | Remove skills from the registry |
 | `/reflect-and-refine rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
+| `/reflect-and-refine audit [<N>]` | Print last N audit entries (default 5). See `~/.reflect-and-refine/audit.md` for full history. |
 
 ## Integration with parent skills
 
@@ -127,8 +128,27 @@ User state:
 ```
 ~/.reflect-and-refine/
 ├── config.json                # registered_skills, max_blocks_per_turn
+├── audit.md                   # human-readable append-only log of every BLOCKED / RATE-LIMITED event
+├── .paused                    # (optional) kill-switch flag file
 └── logs/                      # error logs (hook is fail-open, logs for debugging)
 ```
+
+## Auditability (for humans)
+
+Every time the hook takes action it appends a markdown entry to `~/.reflect-and-refine/audit.md`. The file is meant for human review — open in any editor, grep, or `tail -n 50`. Example entry:
+
+```markdown
+---
+## 2026-04-23 00:58:07 UTC · session=abc12345 · event=BLOCKED
+- **count**: 1/3
+- **gate_trigger**: registered skill invocation in transcript
+- **user_request_head**: "2要做的。另外还要加一个审计面板..."
+- **agent_response_head**: "两个任务安排：先做审计面板..."
+- **agent_response_full_chars**: 110
+- **reviewer_reason_chars**: 3739
+```
+
+Events logged: `BLOCKED` (reason was injected), `RATE-LIMITED` (would have blocked but per-turn cap reached). Silent passes (gate closed, paused, env-disabled) are not logged by default — their absence in the audit log is itself the signal.
 
 ## Limitations
 

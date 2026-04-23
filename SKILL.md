@@ -60,6 +60,11 @@ When invoked: read config, append names (de-duplicated), write back. Preserve un
 ### `/reflect-and-refine unregister <skill-name> [<skill-name> ...]`
 Remove skill names from the registered list.
 
+### `/reflect-and-refine audit [<N>]`
+Print the last N audit entries from `~/.reflect-and-refine/audit.md` (default N=5). Each hook fire that resulted in BLOCKED or RATE-LIMITED is recorded there with: timestamp, session, counter state, gate trigger, and head excerpts of the user request and agent response. Use this to see whether the hook is actually firing and what it saw — it is the primary visibility surface for human users.
+
+If no audit file exists, say so (means the hook has never fired, or was always paused/closed).
+
 ### `/reflect-and-refine rate-limit [<N>] [--force]`
 Get or set `max_blocks_per_turn` — how many times the hook may block consecutively within one user turn before giving up and allowing the stop.
 

@@ -16,18 +16,20 @@ import re
 import sys
 import traceback
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 HOME = Path(os.path.expanduser("~"))
 CONFIG_DIR = HOME / ".reflect-and-refine"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PAUSE_FLAG = CONFIG_DIR / ".paused"
 LOG_DIR = CONFIG_DIR / "logs"
+AUDIT_LOG = CONFIG_DIR / "audit.md"
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_TEMPLATE = SKILL_ROOT / "prompts" / "reviewer-template.md"
 
 SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
+AUDIT_HEAD_MAX = 150  # chars to show in audit excerpts
 
 
 def log_error(msg: str) -> None:
@@ -38,6 +40,39 @@ def log_error(msg: str) -> None:
             f.write(f"[{datetime.now().isoformat()}] {msg}\n")
     except Exception:
         pass  # last-resort: don't let logging itself break us
+
+
+def _head(s: str, n: int = AUDIT_HEAD_MAX) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def audit_log(event: str, session_id: str, details: dict) -> None:
+    """
+    Append a markdown audit entry. Never raises — logging must not break the hook.
+    One entry = one heading + a bullet list. Append-only, newest-at-bottom.
+    """
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not AUDIT_LOG.exists() or AUDIT_LOG.stat().st_size == 0:
+            AUDIT_LOG.write_text(
+                "# reflect-and-refine audit log\n\n"
+                "Every hook fire that took action (BLOCKED or RATE-LIMITED) is "
+                "recorded here for human review. Append-only; prune manually if needed.\n\n"
+            )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        short_sess = (session_id or "unknown")[:8]
+        lines = [
+            "---",
+            f"## {now} · session={short_sess} · event={event}",
+        ]
+        for k, v in details.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")  # trailing blank
+        with AUDIT_LOG.open("a") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        log_error(f"audit_log failed: {e}")
 
 
 def load_config() -> dict:
@@ -264,8 +299,26 @@ def main() -> None:
 
     max_blocks = int(config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN))
     last_ts = last_user_timestamp(records)
+    state_file = Path(f"/tmp/rar-{session_id or 'unknown'}.state")
+    prior_count = 0
+    try:
+        if state_file.exists():
+            parts = state_file.read_text().strip().split(maxsplit=1)
+            if len(parts) == 2 and parts[0] == last_ts:
+                prior_count = int(parts[1])
+    except Exception:
+        prior_count = 0
+
     should_block = increment_counter(session_id or "unknown", last_ts, max_blocks)
     if not should_block:
+        audit_log(
+            "RATE-LIMITED",
+            session_id,
+            {
+                "reason": f"per-turn cap reached ({prior_count}/{max_blocks}); stop allowed",
+                "turn_user_ts": last_ts,
+            },
+        )
         return
 
     try:
@@ -278,6 +331,18 @@ def main() -> None:
     try:
         out = {"decision": "block", "reason": reason}
         print(json.dumps(out))
+        audit_log(
+            "BLOCKED",
+            session_id,
+            {
+                "count": f"{prior_count + 1}/{max_blocks}",
+                "gate_trigger": "registered skill invocation in transcript",
+                "user_request_head": _head(request_text),
+                "agent_response_head": _head(agent_text),
+                "agent_response_full_chars": len(agent_text),
+                "reviewer_reason_chars": len(reason),
+            },
+        )
     except Exception as e:
         log_error(f"emit failed: {e}")
         return

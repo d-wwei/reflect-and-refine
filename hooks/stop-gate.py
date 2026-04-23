@@ -31,6 +31,12 @@ SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
 AUDIT_HEAD_MAX = 150  # chars to show in audit excerpts
 
+# Subcommands of /reflect-and-refine that are query/config — they MUST NOT
+# be treated as activation markers. Only `shutdown` closes the gate;
+# `activate` (or empty args) opens it; anything else listed here is
+# transparent to gate state.
+IDEMPOTENT_RAR_SUBCOMMANDS = {"status", "audit", "rate-limit", "register", "unregister"}
+
 
 def log_error(msg: str) -> None:
     try:
@@ -119,9 +125,13 @@ def is_real_user_record(rec: dict) -> bool:
 def gate_state(records: list[dict], registered_skills: set[str]) -> str:
     """
     Scan real user records from newest to oldest. Return 'OPEN' or 'CLOSED'.
-    - Last marker is a shutdown for reflect-and-refine -> CLOSED
-    - Last marker is an invocation of any registered skill -> OPEN
-    - No markers found -> CLOSED
+
+    Rules (last matching real-user command wins; query subcommands are transparent):
+    - /reflect-and-refine shutdown              -> CLOSED
+    - /reflect-and-refine activate | (no args)  -> OPEN
+    - /reflect-and-refine <idempotent-query>    -> skip (doesn't change state)
+    - /<any-other-registered-skill>             -> OPEN
+    - no markers found                          -> CLOSED
     """
     name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
     args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
@@ -136,8 +146,15 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> str:
         args_match = args_pat.search(content)
         args = args_match.group(1).strip() if args_match else ""
 
-        if skill == "reflect-and-refine" and args == SHUTDOWN_MARKER_ARGS:
-            return "CLOSED"
+        if skill == "reflect-and-refine":
+            first_arg = args.split()[0] if args else ""
+            if first_arg == SHUTDOWN_MARKER_ARGS:
+                return "CLOSED"
+            if first_arg in IDEMPOTENT_RAR_SUBCOMMANDS:
+                continue  # query/config — transparent to gate state
+            # activate, empty, or unknown subcommand -> fail-safe OPEN
+            return "OPEN"
+
         if skill in registered_skills:
             return "OPEN"
     return "CLOSED"
@@ -245,6 +262,36 @@ def build_block_reason(request_text: str, agent_text: str) -> str:
               .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
 
 
+SESSION_BANNER = (
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "REFLECT-AND-REFINE ACTIVE · First review this session.\n"
+    "  Active because: a registered skill was invoked in this session.\n"
+    "  Disable for this session: /reflect-and-refine shutdown\n"
+    "  Persistent disable:       touch ~/.reflect-and-refine/.paused\n"
+    "  Settings:                 /reflect-and-refine status | rate-limit <N>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+)
+
+
+def maybe_prepend_banner(reason: str, session_id: str) -> tuple[str, bool]:
+    """
+    On the first hook block of a session, prepend a banner so the user sees why
+    reflect-and-refine is active and how to disable it. Tracked via a marker
+    file in /tmp so it self-expires on reboot.
+    Returns (reason_possibly_with_banner, banner_was_shown).
+    """
+    marker = Path(f"/tmp/rar-{session_id or 'unknown'}.banner-shown")
+    if marker.exists():
+        return reason, False
+    try:
+        marker.touch()
+    except Exception as e:
+        log_error(f"banner marker write failed: {e}")
+        # If we can't mark it, showing the banner twice is still acceptable;
+        # proceed to show.
+    return SESSION_BANNER + reason, True
+
+
 def main() -> None:
     # Emergency shutdown (checked BEFORE reading stdin so it's as cheap as
     # possible):
@@ -324,6 +371,7 @@ def main() -> None:
     try:
         request_text, agent_text = last_user_command_parts(records)
         reason = build_block_reason(request_text, agent_text)
+        reason, banner_shown = maybe_prepend_banner(reason, session_id or "unknown")
     except Exception as e:
         log_error(f"build reason failed: {e}")
         return
@@ -337,6 +385,7 @@ def main() -> None:
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": "registered skill invocation in transcript",
+                "banner_shown": "yes (first block this session)" if banner_shown else "no",
                 "user_request_head": _head(request_text),
                 "agent_response_head": _head(agent_text),
                 "agent_response_full_chars": len(agent_text),

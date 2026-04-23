@@ -117,29 +117,51 @@ mv "$TMP_FILE" "$SETTINGS_FILE"
 echo "hook installed in: $SETTINGS_FILE"
 
 # Config file + prompts scaffolding
-mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides" "$CONFIG_DIR/prompts/scenarios"
 if [ ! -f "$CONFIG_FILE" ]; then
-  echo '{"registered_skills":["reflect-and-refine"],"max_blocks_per_turn":3,"suppress_output":true,"reviewer":{"per_skill":{}}}' > "$CONFIG_FILE"
+  cat > "$CONFIG_FILE" <<'JSON'
+{
+  "registered_skills": ["reflect-and-refine"],
+  "max_blocks_per_turn": 3,
+  "suppress_output": true,
+  "reviewer": {
+    "skill_scenario_map": {},
+    "per_skill": {}
+  }
+}
+JSON
 fi
 
-# Seed user-level default prompt so it's visible and editable in-place.
-# Users can modify this file or run `/reflect-and-refine customize` (no skill
-# arg) to regenerate its frontmatter.
+# Seed user-level default prompt (fallback when no scenario is mapped).
 USER_DEFAULT="$CONFIG_DIR/prompts/default.md"
 if [ ! -f "$USER_DEFAULT" ]; then
   cp "$SKILL_ROOT/prompts/reviewer-template.md" "$USER_DEFAULT"
   echo "seeded user-level default prompt: $USER_DEFAULT"
 fi
 
-# Register additional skills if requested
+# Scenarios directory starts empty on the user side; the hook falls through
+# to the bundled scenarios shipped with the skill. Users who want to edit
+# a scenario run `/reflect-and-refine customize scenario <name>` which
+# copies the bundled file into $CONFIG_DIR/prompts/scenarios/ for editing.
+
+# Register additional skills if requested. When registering a known
+# series skill (better-code / better-test / better-work), also seed a
+# sensible skill_scenario_map entry unless one already exists.
 if [ ${#REGISTER_SKILLS[@]} -gt 0 ]; then
   TMP_CFG="$(mktemp)"
   jq --argjson skills "$(printf '%s\n' "${REGISTER_SKILLS[@]}" | jq -R . | jq -s .)" '
-    .registered_skills = ((.registered_skills // []) + $skills | unique)
+    .registered_skills = ((.registered_skills // []) + $skills | unique) |
+    .reviewer = (.reviewer // {}) |
+    .reviewer.skill_scenario_map = (.reviewer.skill_scenario_map // {}) |
+    # Seed known-skill → scenario defaults WITHOUT overwriting user choices
+    (.reviewer.skill_scenario_map["better-code"] //= "coding") |
+    (.reviewer.skill_scenario_map["better-test"] //= "testing") |
+    (.reviewer.skill_scenario_map["better-work"] //= "general")
   ' "$CONFIG_FILE" > "$TMP_CFG"
   jq -e . "$TMP_CFG" >/dev/null 2>&1 || { rm -f "$TMP_CFG"; die "config merge failed"; }
   mv "$TMP_CFG" "$CONFIG_FILE"
   echo "registered: ${REGISTER_SKILLS[*]}"
+  echo "seeded skill_scenario_map defaults (better-code→coding, better-test→testing, better-work→general) where not already set"
 fi
 
 echo

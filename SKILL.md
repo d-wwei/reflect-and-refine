@@ -7,7 +7,7 @@ description: |
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
   protocols. Works standalone; integrates loosely with any parent skill via registration.
-  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin.
+  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin, map.
 ---
 
 # Reflect and Refine
@@ -48,15 +48,41 @@ the invocation itself leaves a marker in the transcript that the hook recognizes
 Close the gate for the remainder of the session. Emits a shutdown marker. Can be reopened by
 invoking any registered skill again (including `/reflect-and-refine activate`).
 
-### `/reflect-and-refine pin <skill>`
-Scope the gate to **only this skill** for the remainder of the session. When pinned, invocations of other registered skills do NOT open the gate — only `<skill>` does.
+### `/reflect-and-refine pin <scenario-or-skill>`
+Scope the gate to a **scenario** (preferred) or a **specific skill**. Default interpretation is scenario — explicit skill pinning requires the `skill` keyword.
 
-Use case: "I'm running `/better-test` for a while, and I want reflect-and-refine to audit only those stops, not any side `/better-code` work I happen to do in the same session."
+**Scenario pin** (recommended — stable across skill churn):
+```
+/reflect-and-refine pin coding        # scope gate to any skill mapped to coding
+/reflect-and-refine pin scenario coding   # same, explicit
+/reflect-and-refine pin testing
+```
+The gate fires only for skills whose `skill_scenario_map` entry equals the pinned scenario. Unmapped skills (no scenario) will NOT trigger while a scenario pin is active.
 
-Implementation: writes a pin marker in the transcript. The hook scans for pin/unpin directives separately from gate activation — pin by itself does not open the gate; the skill you pinned to must still be invoked normally to trigger.
+**Skill pin** (escape hatch — use only when one specific skill needs isolation):
+```
+/reflect-and-refine pin skill better-code    # only /better-code triggers; other skills quiet
+```
+
+**Use cases**:
+- Long coding session: `pin coding` → audits `/better-code`, `/dev-coder`, any mapped coding skill; quiet on `/better-test` side work.
+- Debugging an incident: `pin debugging` → all debugging skills audited strictly; coding changes made during triage audited by their own scenario.
+- Isolating one tool: `pin skill better-test` → only `/better-test` audited.
 
 ### `/reflect-and-refine unpin`
-Clear any active pin — the gate will again activate for any registered skill. Emits an unpin marker; last pin/unpin directive in the transcript wins.
+Clear any active pin — gate returns to "any registered skill triggers". Last pin/unpin directive in the transcript wins.
+
+### `/reflect-and-refine map <skill> <scenario>`
+Add or update a skill → scenario mapping in `~/.reflect-and-refine/config.json`. Enables scenario-based routing and scenario pins to include this skill.
+
+```
+/reflect-and-refine map my-custom-coder coding      # route my-custom-coder through coding.md
+/reflect-and-refine map my-qa-assistant testing
+```
+
+When invoked: read config, set `reviewer.skill_scenario_map.<skill> = <scenario>`, write back preserving other fields. If `<scenario>` is not one of the built-in scenarios (coding / testing / debugging / general / or whatever files exist in `prompts/scenarios/`), warn but allow — the user may be about to create a new scenario file.
+
+To remove a mapping, use `map <skill>` with no scenario, or edit config.json directly.
 
 ### `/reflect-and-refine status`
 Show the current gate state, registered skills, per-turn block count, and whether any kill switch is active.
@@ -83,51 +109,66 @@ Print the last N audit entries from `~/.reflect-and-refine/audit.md` (default N=
 
 If no audit file exists, say so (means the hook has never fired, or was always paused/closed).
 
-### `/reflect-and-refine customize [<skill>]`
+### `/reflect-and-refine customize [<target-spec>]`
 
-Interactive wizard to create or edit a per-skill reviewer prompt override. Generates a structured markdown file (YAML frontmatter + body placeholders) the hook will route to when the named skill triggers the gate.
+Fully interactive, guided wizard to create or edit a reviewer prompt. **Every entry point is dialog-driven** — the agent asks questions rather than assuming intent. Optional positional args shortcut the first step only.
 
-**Where the file lands**:
-- `<skill>` given → `~/.reflect-and-refine/prompts/overrides/<skill>.md`, plus a routing entry added to `config.json` → `reviewer.per_skill.<skill>`.
-- `<skill>` omitted → edit the global default at `~/.reflect-and-refine/prompts/default.md` (used when no per-skill override exists).
+**Invocation forms**:
 
-**Dialog flow** (main agent asks each question, collects the answer, generates the file at the end):
+| Form | First dialog step |
+|------|------------------|
+| `/reflect-and-refine customize` | "What would you like to customise? (default / scenario / skill)" |
+| `/reflect-and-refine customize default` | Skip to default-edit dialog |
+| `/reflect-and-refine customize scenario` | "Which scenario? (coding / testing / debugging / general / new)" |
+| `/reflect-and-refine customize scenario coding` | Skip to coding-edit dialog |
+| `/reflect-and-refine customize skill` | "Which skill do you want a per-skill override for?" |
+| `/reflect-and-refine customize skill better-code` | Skip to skill-override dialog |
 
-1. **Target skill** — if no arg given, ask: "Edit the global default, or override for a specific skill? Enter a skill name or 'default'."
-2. **Language** — "Response language for the reviewer? (en / zh / free text like 'Chinese, keep code identifiers in English')"
-3. **Strictness** — offer three:
-   - `lenient` — only serious gaps are flagged
-   - `default` — standard completion review (recommended)
-   - `strict` — assume the agent is cutting corners; prove it
-4. **Built-in dimensions** — multi-select from:
-   - `requirement_split` — enumerate every distinct requirement
-   - `evidence` — each requirement must have concrete artifact
-   - `hedging` — flag "should"/"probably"/"likely"
-   - `silent_drops` — requirement silently dropped or deferred
-   - `fake_evidence` — references to nonexistent files / unrun tests
-   - `consistency` — internal consistency of the response
-   - `completeness` — implicit sub-questions also answered
+**Three target types and where the file lands**:
 
-   Defaults to the first 5. Agent should list them with checkboxes and let the user toggle.
-5. **Custom checks** — "Any project-specific checks? (leave empty to skip). For each, provide a short `name` and `description`."
-6. **Preview** — show the agent the assembled YAML frontmatter before writing:
-   ```yaml
-   language: ...
-   strictness: ...
-   dimensions: [...]
-   custom_checks: [...]
-   ```
-   User confirms.
-7. **Write** — main agent writes the file:
-   - Frontmatter as captured above
-   - Body copied from the bundled template at `<skill-install-root>/prompts/reviewer-template.md` (so placeholders like `{USER_REQUEST}` etc. are preserved). If the file already exists, confirm overwrite first.
-8. **Routing** — if target was a specific skill:
-   - Read `~/.reflect-and-refine/config.json`
-   - jq-merge `.reviewer.per_skill.<skill>` = `"prompts/overrides/<skill>.md"`
-   - Write back, preserving unknown fields
-9. **Confirm** — print the final path, say "Active on next `/<skill>` invocation in a new Claude Code session (or immediately — the hook rereads config on every Stop)."
+| Target | File location | Hook resolution layer | When to use |
+|--------|---------------|---------------------|-------------|
+| `default` | `~/.reflect-and-refine/prompts/default.md` | Layer 4 (fallback for unmapped skills) | Baseline for anything without a scenario mapping |
+| `scenario <name>` | `~/.reflect-and-refine/prompts/scenarios/<name>.md` | Layer 3 (main path — skills routed here via `skill_scenario_map`) | Domain-level tuning; **recommended** |
+| `skill <name>` | `~/.reflect-and-refine/prompts/overrides/<name>.md` + `config.json` `reviewer.per_skill.<name>` entry | Layer 1-2 (beats scenario) | Escape hatch when one specific skill needs unusual treatment |
 
-**Note**: the user may want to keep editing the generated file by hand. Print the path clearly. The wizard only captures the frontmatter; body changes (custom role text, modified verdict schema) require direct editing.
+**Dialog flow** (after target is known, same steps apply to all three targets):
+
+1. **Overwrite check** — if the target file already exists, show its current values and ask: "Edit existing / overwrite fresh / cancel?"
+2. **Language** — "Response language for the reviewer? (en / zh / free text)"
+3. **Strictness** — offer three options with one-line descriptions:
+   - `lenient` — flag only serious gaps
+   - `default` — standard completion review
+   - `strict` — assume the agent is cutting corners
+4. **Model preference** — "Which Claude tier for the reviewer subagent?":
+   - `haiku` — fast + cheap (routine checks)
+   - `sonnet` — balanced (most projects)
+   - `opus` — deepest analysis (high-stakes reviews)
+   - `default` — inherit the main session's model
+5. **Dimensions** — multi-select from 7 built-ins (show as numbered list, let user toggle on/off):
+   - 1. `requirement_split` — enumerate every distinct requirement
+   - 2. `evidence` — each requirement must have concrete artifact
+   - 3. `hedging` — flag "should"/"probably"/"likely"
+   - 4. `silent_drops` — requirement silently dropped or deferred
+   - 5. `fake_evidence` — references to nonexistent files / unrun tests
+   - 6. `consistency` — internal consistency of the response
+   - 7. `completeness` — implicit sub-questions also answered
+   Suggest sensible defaults based on target type (e.g., coding scenario defaults lean toward evidence + fake_evidence).
+6. **Custom checks** — "Any project-specific checks? (leave empty to skip)" — for each, collect `name` and one-line `description`. Let user add multiple in a loop.
+7. **Preview** — show the agent the assembled YAML frontmatter and ask: "Looks right? (yes / adjust / cancel)"
+8. **Write** — write the file:
+   - Use the appropriate body template (bundled `reviewer-template.md` for fresh, or `prompts/scenarios/general.md` as a starting point for new scenarios)
+   - Preserve all placeholders (`{USER_REQUEST}`, `{AGENT_RESPONSE}`, `{LANGUAGE}`, `{STRICTNESS_DIRECTIVE}`, `{MODEL_PREFERENCE_PARAM}`, `{DIMENSIONS_BLOCK}`, `{CUSTOM_CHECKS_BLOCK}`)
+9. **Routing (skill-target only)** — if target was `skill <name>`, merge `.reviewer.per_skill.<name> = "prompts/overrides/<name>.md"` into config.json. For `default` and `scenario`, no config change needed.
+10. **Confirm** — print the final file path and (for skill) the config routing. Tell the user: "Takes effect on the next hook fire — no restart needed; the hook rereads config and re-parses the prompt file on every Stop event."
+
+**Principles**:
+
+- **Never assume**: even with all positional args, the agent must still run through language/strictness/dimensions/custom_checks — those are the actual customisation work.
+- **Show defaults**: on each question, show the current/default value so the user can press enter / say "keep".
+- **Allow back-stepping**: if the user at step 7 says "adjust", go back to the relevant step(s) rather than restarting.
+- **Be forgiving of target typos**: if the user says "scenario codeing" and there's no `codeing.md` in scenarios/, ask: "No scenario named 'codeing' exists. Create new / did you mean 'coding'?"
+- **Mention scenario vs skill trade-off**: when user invokes `customize skill <x>`, remind: "Most users are better served by customising a scenario. Are you sure you want a per-skill override?" unless the answer is obvious.
 
 ### `/reflect-and-refine rate-limit [<N>] [--force]`
 Get or set `max_blocks_per_turn` — how many times the hook may block consecutively within one user turn before giving up and allowing the stop.
@@ -149,11 +190,25 @@ Stored in `~/.reflect-and-refine/config.json`:
 
 ```json
 {
-  "registered_skills": ["reflect-and-refine"],
+  "registered_skills": ["reflect-and-refine", "better-work", "better-code", "better-test"],
   "max_blocks_per_turn": 3,
-  "suppress_output": true
+  "suppress_output": true,
+  "reviewer": {
+    "skill_scenario_map": {
+      "better-code": "coding",
+      "better-test": "testing",
+      "better-work": "general"
+    },
+    "per_skill": {}
+  }
 }
 ```
+
+**`skill_scenario_map`** (main routing): skill name → scenario name. The hook looks up the scenario at trigger time and uses `prompts/scenarios/<scenario>.md`. Update via `/reflect-and-refine map <skill> <scenario>`.
+
+**`reviewer.per_skill`** (escape hatch): skill name → absolute or relative path to a specific prompt file. Takes precedence over scenario lookup. Use when one skill needs treatment completely different from its domain scenario.
+
+**`suppress_output`** (default `true`): see "Customising the reviewer → terminal noise" in README.
 
 **`suppress_output`** (default `true`): when true, the injected reviewer prompt dump does NOT render in the terminal — Claude Code shows only a brief "Ran 1 stop hook" summary line (collapsed; press ctrl+o to expand). The main agent still receives the full instructions in its context. Set to `false` if you want to see the full prompt in the terminal for debugging. First-time session banner is also suppressed in quiet mode.
 

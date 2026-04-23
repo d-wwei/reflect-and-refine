@@ -138,24 +138,72 @@ User state:
 └── logs/                      # error logs (hook is fail-open, logs for debugging)
 ```
 
-## Customising the reviewer
+## Customising the reviewer — scenarios vs skills
 
-Every reviewer prompt is a markdown file with **YAML frontmatter** (structured config) + **body** (free-form prose with placeholders the hook fills at run time). Three ways to customise:
+reflect-and-refine binds prompts to **scenarios** (stable workflow categories), not directly to skill names. A skill like `/better-code` is mapped to the `coding` scenario; when it triggers the gate, the `coding` reviewer prompt is used. This way:
 
-1. **Quickest — frontmatter edit**: open `~/.reflect-and-refine/prompts/default.md`, change `language`, `strictness`, or the `dimensions` list. Takes effect next Stop event (hook rereads on every fire).
-2. **Guided — interactive wizard**: run `/reflect-and-refine customize` (global default) or `/reflect-and-refine customize better-code` (per-skill). The main agent walks you through a 9-step dialog and writes the file for you.
-3. **Power-user — hand-written body**: copy the bundled template, rewrite the role text / verdict schema / post-verdict actions to taste. Placeholders honoured by the hook: `{USER_REQUEST}`, `{AGENT_RESPONSE}`, `{LANGUAGE}`, `{STRICTNESS_DIRECTIVE}`, `{DIMENSIONS_BLOCK}`, `{CUSTOM_CHECKS_BLOCK}`.
+- Adding a new coding skill (`/dev-coder`, `/claude-code`, whatever) just needs a map entry, not a new prompt file.
+- Improving the `coding` reviewer improves review for ALL coding skills at once.
+- Prompts don't rot when skill names change.
+
+### Built-in scenarios
+
+| Scenario | Specialised for | Default strictness |
+|----------|----------------|-------------------|
+| `general` | Fallback, no specialisation | default |
+| `coding` | Source code changes — hunts fabricated test output, placeholder code, unverified "should compile" | default |
+| `testing` | Test authorship + runs — demands raw test output, edge cases enumerated, no silenced tests | **strict** |
+| `debugging` | Bug diagnosis + fixes — demands root cause (not symptom), pre-fix reproduction, post-fix verification, regression test | default |
+
+Each lives at `<install_root>/prompts/scenarios/<name>.md` (bundled) or `~/.reflect-and-refine/prompts/scenarios/<name>.md` (user override — created on first `customize`).
+
+### Three ways to customise
+
+1. **Quickest — frontmatter edit**: open the scenario file (or default.md), change `language`, `strictness`, `model`, or the `dimensions` list. Takes effect on the next Stop event (hook rereads on every fire).
+2. **Guided — fully interactive wizard**: `/reflect-and-refine customize` (no args) — agent asks "default / scenario / skill?" then walks you through language, strictness, model, dimensions, custom checks. Every step has a default; you can just accept. Works for any target type.
+3. **Power-user — hand-written body**: copy `<install_root>/prompts/scenarios/general.md` as a starting point, rewrite role text / verdict schema / action protocol. Placeholders honoured by the hook: `{USER_REQUEST}`, `{AGENT_RESPONSE}`, `{LANGUAGE}`, `{STRICTNESS_DIRECTIVE}`, `{MODEL_PREFERENCE_PARAM}`, `{DIMENSIONS_BLOCK}`, `{CUSTOM_CHECKS_BLOCK}`.
+
+### Adding a new scenario
+
+```
+/reflect-and-refine customize scenario          # wizard; type a new name when prompted
+/reflect-and-refine map my-research-skill research   # route the skill to it
+```
+
+The scenario file lives at `~/.reflect-and-refine/prompts/scenarios/<name>.md` and is edited like any built-in.
+
+### Mapping a new skill
+
+```
+/reflect-and-refine map <skill> <scenario>
+```
+
+Or edit `config.json` → `reviewer.skill_scenario_map.<skill>` directly. Unmapped skills fall through to `default.md`.
 
 ### Prompt resolution order (highest priority first)
 
 ```
-1. config.reviewer.per_skill.<triggered_skill>  (explicit mapping in config.json)
-2. ~/.reflect-and-refine/prompts/overrides/<triggered_skill>.md
-3. ~/.reflect-and-refine/prompts/default.md     (user-level default)
-4. <install_root>/prompts/reviewer-template.md  (bundled fallback)
+1. config.reviewer.per_skill.<skill>                      (skill-level file mapping — rare)
+2. ~/.reflect-and-refine/prompts/overrides/<skill>.md     (skill-level file override)
+3. scenario lookup: skill_scenario_map[<skill>] →
+   a. ~/.reflect-and-refine/prompts/scenarios/<scenario>.md   (user)
+   b. <install_root>/prompts/scenarios/<scenario>.md          (bundled)
+4. ~/.reflect-and-refine/prompts/default.md                (user default)
+5. <install_root>/prompts/reviewer-template.md             (bundled final fallback)
 ```
 
-### Built-in dimensions
+Layers 1–2 are escape hatches; layer 3 (scenario) is the main path.
+
+### Pinning: scope the gate to one scenario or skill
+
+```
+/reflect-and-refine pin coding               # only skills mapped to coding trigger
+/reflect-and-refine pin scenario testing     # same, explicit
+/reflect-and-refine pin skill better-test    # only /better-test triggers (escape hatch)
+/reflect-and-refine unpin                    # clear
+```
+
+### Built-in dimensions (used inside scenarios / default / skill overrides)
 
 Each can be toggled via the `dimensions` list in frontmatter; the hook renders each name using its internal snippet (one of three strictness variants):
 

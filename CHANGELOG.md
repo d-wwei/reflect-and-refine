@@ -4,13 +4,31 @@ All notable changes to `reflect-and-refine` are recorded here. Format follows [K
 
 ## [Unreleased]
 
-### Added
+### Added — scenario-based prompt binding (major architectural change)
+- **Scenario layer** between skills and reviewer prompts. Reviewer prompts are now bound to workflow scenarios (`coding`, `testing`, `debugging`, `general`), not to skill names directly. `skill_scenario_map` in config.json maps skill → scenario; the hook resolves the prompt via scenario lookup. Downstream benefit: a new coding skill just needs a map entry, not a new prompt file.
+- **3 specialised bundled scenarios** (`coding.md`, `testing.md`, `debugging.md`) written precisely — each has domain-specific role text + dimension selection + custom_checks. `general.md` ships as a baseline.
+  - `coding` — hunts fabricated test output, placeholder code, unverified "should compile"
+  - `testing` — strict by default; demands raw test output, edge case enumeration, no silenced tests
+  - `debugging` — demands root cause (not symptom), pre-fix reproduction, post-fix verification, regression test, sibling-instance audit
+- **`/reflect-and-refine map <skill> <scenario>`** subcommand to add/update skill→scenario mappings.
+- **Scenario-scope pin**: `/reflect-and-refine pin <scenario>` (default interpretation) scopes the gate to only those skills mapped to the scenario. `pin skill <name>` remains as the escape hatch for specific-skill pinning. `find_pinned_skill()` replaced by `find_pin_directive()` returning `(scope, target)`.
+- **Fully interactive customize wizard**. `/reflect-and-refine customize` with no args now asks "default / scenario / skill?" then branches. `customize scenario`, `customize scenario coding`, `customize skill`, `customize skill better-code` are all valid shortcut entry points; all still run the full question dialog for language/strictness/model/dimensions/custom_checks. Never assumes — every step shows defaults.
+- Installer seeds `~/.reflect-and-refine/prompts/scenarios/` directory (empty on user side; hook falls through to bundled). `install.sh --register <skill>` now seeds sensible `skill_scenario_map` defaults for known series skills (better-code→coding, better-test→testing, better-work→general) without overwriting existing user choices.
+
+### Added — smaller items
 - `model_preference` (alias: `model`) frontmatter field so users can pin the reviewer sub-agent to `haiku` | `sonnet` | `opus`. `default`, empty, or any unrecognised value omits the `model` param from the Task call and lets Claude Code pick. Rendered into the prompt body via `{MODEL_PREFERENCE_PARAM}`.
-- `tests/run.py` — 45-test stdlib-only suite covering frontmatter parsing, real-user filtering, gate-state semantics (all subcommands), dimension snippet assembly, custom-checks rendering, 4-layer prompt resolution, and end-to-end `build_block_reason` with model variants. Runnable as `python3 tests/run.py`.
-- User-visible error hint: when the hook silently fails (bad YAML, stdin parse error, etc.), one line is emitted to stderr pointing at `~/.reflect-and-refine/logs/` so users know where to look.
+- `tests/run.py` — 63-test stdlib-only suite covering frontmatter parsing, real-user filtering, gate-state semantics (all subcommands), pin directive scope (scenario vs skill), scenario lookup, dimension snippet assembly, custom-checks rendering, 5-layer prompt resolution, and end-to-end `build_block_reason` with model variants.
+- User-visible error hint: when the hook silently fails (bad YAML, stdin parse error, etc.), one line is emitted to stderr pointing at `~/.reflect-and-refine/logs/`.
+- SKILL.md frontmatter `Subcommands:` line updated to include `audit`, `rate-limit`, `customize`, `pin`, `unpin`, `map` (a prior bug — the three were missing from the declaration since v0.1.3/v0.1.4/v0.2.0).
+
+### Changed
+- Audit log records `triggered_scenario` and `pinned_to` (with scope) so you can see the full context of each block.
+- Prompt resolution expands from 4 layers to 5 (scenario lookup inserted as layer 3).
 
 ### Fixed
-- Re-seed `~/.reflect-and-refine/prompts/default.md` on install no longer needed for existing users — `build_block_reason` falls back to hardcoded defaults when a frontmatter field is missing, so older user-level defaults keep working.
+- Unknown `/reflect-and-refine` subcommand now falls through as transparent (doesn't change gate state) — was previously "fail-safe open".
+- `suppressOutput=true` on block decision prevents the reviewer prompt wall from rendering in the terminal (collapsed to `Ran 1 stop hook` summary). Main agent still sees the full reason.
+- `is_real_user_record()` correctly filters hook injections (`isMeta: true`) and tool results, preventing the hook from grabbing its own prior injections as user input.
 
 ## [0.2.0] — 2026-04-23 · commit `14f16d9`
 

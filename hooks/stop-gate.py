@@ -27,9 +27,11 @@ LOG_DIR = CONFIG_DIR / "logs"
 AUDIT_LOG = CONFIG_DIR / "audit.md"
 USER_PROMPTS_DIR = CONFIG_DIR / "prompts"
 USER_OVERRIDES_DIR = USER_PROMPTS_DIR / "overrides"
+USER_SCENARIOS_DIR = USER_PROMPTS_DIR / "scenarios"
 USER_DEFAULT_PROMPT = USER_PROMPTS_DIR / "default.md"
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 BUNDLED_PROMPT = SKILL_ROOT / "prompts" / "reviewer-template.md"
+BUNDLED_SCENARIOS_DIR = SKILL_ROOT / "prompts" / "scenarios"
 
 SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
@@ -351,13 +353,27 @@ def assemble_custom_checks_block(custom_checks: list) -> str:
     return "\n".join(lines)
 
 
+def scenario_for_skill(triggered_skill: str, config: dict) -> str:
+    """Return the scenario name mapped to this skill, or '' if unmapped."""
+    reviewer_cfg = config.get("reviewer", {}) if isinstance(config.get("reviewer"), dict) else {}
+    ssm = reviewer_cfg.get("skill_scenario_map", {})
+    if isinstance(ssm, dict):
+        val = ssm.get(triggered_skill)
+        if isinstance(val, str):
+            return val.strip()
+    return ""
+
+
 def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
     """
-    Three-layer fallback (highest precedence first):
-      1. Explicit per-skill path in config.reviewer.per_skill.<skill>
-      2. ~/.reflect-and-refine/prompts/overrides/<triggered_skill>.md
-      3. ~/.reflect-and-refine/prompts/default.md (user-writable)
-      4. <bundled>/prompts/reviewer-template.md (ships with skill)
+    Five-layer fallback (highest precedence first):
+      1. config.reviewer.per_skill.<skill>                    (explicit file mapping)
+      2. ~/.reflect-and-refine/prompts/overrides/<skill>.md   (file-based skill override)
+      3. scenario lookup:
+         a. ~/.reflect-and-refine/prompts/scenarios/<scenario>.md  (user-writable)
+         b. <bundled>/prompts/scenarios/<scenario>.md              (ships with skill)
+      4. ~/.reflect-and-refine/prompts/default.md             (user default)
+      5. <bundled>/prompts/reviewer-template.md               (final fallback)
     """
     reviewer_cfg = config.get("reviewer", {}) if isinstance(config.get("reviewer"), dict) else {}
     per_skill = reviewer_cfg.get("per_skill", {}) if isinstance(reviewer_cfg.get("per_skill"), dict) else {}
@@ -377,22 +393,35 @@ def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
         if override.exists():
             return override
 
-    # Layer 3: user-level default
+    # Layer 3: scenario lookup (the main path — matches user mental model)
+    scenario = scenario_for_skill(triggered_skill, config)
+    if scenario:
+        user_scenario = USER_SCENARIOS_DIR / f"{scenario}.md"
+        if user_scenario.exists():
+            return user_scenario
+        bundled_scenario = BUNDLED_SCENARIOS_DIR / f"{scenario}.md"
+        if bundled_scenario.exists():
+            return bundled_scenario
+
+    # Layer 4: user-level default
     if USER_DEFAULT_PROMPT.exists():
         return USER_DEFAULT_PROMPT
 
-    # Layer 4: bundled (always exists in a valid install)
+    # Layer 5: bundled (always exists in a valid install)
     return BUNDLED_PROMPT
 
 
-def find_pinned_skill(records: list) -> Optional[str]:
+def find_pin_directive(records: list) -> tuple:
     """
     Scan real user records newest-first for the most recent pin/unpin directive.
-    Returns the pinned skill name, or None if unpinned / no directive found.
+    Returns (scope, target) where scope is 'scenario' | 'skill' | '' (no pin).
 
-    - /reflect-and-refine pin <skill>  → returns <skill>
-    - /reflect-and-refine unpin        → returns None (explicitly clears)
-    - no pin/unpin found               → returns None (default: no pin)
+    Recognised directives (first-arg after `/reflect-and-refine`):
+      pin <name>              → ('scenario', <name>)   — default scope
+      pin scenario <name>     → ('scenario', <name>)
+      pin skill <name>        → ('skill', <name>)
+      unpin                   → ('', '')  — explicitly clears
+      (no directive found)    → ('', '')  — no pin
 
     Last directive wins; subsequent pin replaces earlier pin; unpin clears.
     """
@@ -407,14 +436,37 @@ def find_pinned_skill(records: list) -> Optional[str]:
             continue
         args_m = args_pat.search(content)
         args = (args_m.group(1).strip() if args_m else "")
-        parts = args.split(maxsplit=1)
+        parts = args.split()
         if not parts:
             continue
         verb = parts[0]
         if verb == "unpin":
-            return None
-        if verb == "pin" and len(parts) == 2:
-            return parts[1].strip()
+            return ("", "")
+        if verb == "pin":
+            if len(parts) == 1:
+                continue  # malformed, skip
+            # pin <name>                  -> scenario
+            # pin scenario <name>         -> scenario (explicit)
+            # pin skill <name>            -> skill
+            if parts[1] in ("scenario", "skill") and len(parts) >= 3:
+                return (parts[1], parts[2])
+            # Default: pin <name> → scenario
+            return ("scenario", parts[1])
+    return ("", "")
+
+
+# Back-compat: existing callers / tests may still use the old name. Returns
+# just the pinned target name regardless of scope. Prefer find_pin_directive.
+def find_pinned_skill(records: list) -> Optional[str]:
+    scope, target = find_pin_directive(records)
+    if scope == "skill" and target:
+        return target
+    # Pre-scenario-era tests expected "pin <name>" → skill match; keep that
+    # semantic only for callers who treat the returned value as a skill name.
+    # Note: after v0.2.2 the default scope is 'scenario', so callers that
+    # want skill-specific pinning should use find_pin_directive directly.
+    if scope == "scenario" and target:
+        return None  # scenario pin — this old API has no way to express it
     return None
 
 
@@ -619,15 +671,26 @@ def main() -> None:
     if state != "OPEN":
         return
 
-    # Pin filter: if user pinned the gate to a specific skill, skip unless
-    # the currently-triggering skill matches.
+    # Pin filter: if user pinned the gate, skip unless the currently-triggering
+    # skill matches the pin scope.
+    #   scope='scenario' → triggered_skill's mapped scenario must equal target
+    #   scope='skill'    → triggered_skill must equal target
     try:
-        pinned_skill = find_pinned_skill(records)
+        pin_scope, pin_target = find_pin_directive(records)
     except Exception as e:
-        log_error(f"find_pinned_skill failed: {e}")
-        pinned_skill = None
-    if pinned_skill and triggered_skill != pinned_skill:
-        return
+        log_error(f"find_pin_directive failed: {e}")
+        pin_scope, pin_target = "", ""
+
+    pin_description = "(no pin — all registered skills)"
+    if pin_scope == "skill" and pin_target:
+        pin_description = f"skill={pin_target}"
+        if triggered_skill != pin_target:
+            return
+    elif pin_scope == "scenario" and pin_target:
+        triggered_scenario = scenario_for_skill(triggered_skill, config)
+        pin_description = f"scenario={pin_target}"
+        if triggered_scenario != pin_target:
+            return
 
     max_blocks = int(config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN))
     last_ts = last_user_timestamp(records)
@@ -679,7 +742,8 @@ def main() -> None:
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": f"/{triggered_skill} in transcript",
-                "pinned_to": pinned_skill or "(no pin — all registered skills)",
+                "triggered_scenario": scenario_for_skill(triggered_skill, config) or "(unmapped)",
+                "pinned_to": pin_description,
                 "prompt_source": str(prompt_path).replace(str(HOME), "~"),
                 "suppress_output": "on (quiet)" if suppress_output else "off (verbose)",
                 "user_request_head": _head(request_text),

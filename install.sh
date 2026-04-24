@@ -117,7 +117,7 @@ mv "$TMP_FILE" "$SETTINGS_FILE"
 echo "hook installed in: $SETTINGS_FILE"
 
 # Config file + prompts scaffolding
-mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides" "$CONFIG_DIR/prompts/scenarios"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides" "$CONFIG_DIR/prompts/scenarios" "$CONFIG_DIR/sessions"
 if [ ! -f "$CONFIG_FILE" ]; then
   cat > "$CONFIG_FILE" <<'JSON'
 {

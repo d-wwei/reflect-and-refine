@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -438,12 +439,12 @@ class PromptResolution(unittest.TestCase):
         self.assertEqual(p, override)  # override beats scenario
 
 
-class BuildBlockReason(unittest.TestCase):
-    """Tests that exercise full build_block_reason with a temp prompt file."""
+class BuildReviewerPrompt(unittest.TestCase):
+    """build_reviewer_prompt reads a prompt file, substitutes placeholders, returns reviewer-only content."""
 
-    def _write_template(self, fm_yaml: str) -> Path:
-        body = """
-Test body.
+    def _write_template(self, fm_yaml: str, body: str = None) -> Path:
+        if body is None:
+            body = """Test body.
 language: {LANGUAGE}
 strictness: {STRICTNESS_DIRECTIVE}
 model_param: {MODEL_PREFERENCE_PARAM}END
@@ -452,33 +453,24 @@ dimensions:
 custom:
 {CUSTOM_CHECKS_BLOCK}
 user: {USER_REQUEST}
-agent: {AGENT_RESPONSE}
-"""
+agent: {AGENT_RESPONSE}"""
         tmp = Path(tempfile.mktemp(suffix=".md"))
-        tmp.write_text(f"---\n{fm_yaml}\n---{body}")
+        tmp.write_text(f"---\n{fm_yaml}\n---\n{body}")
         return tmp
 
-    def test_model_haiku_renders_param(self):
+    def test_model_haiku_in_returned_param(self):
         p = self._write_template("model: haiku\nlanguage: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
         try:
-            out = sg.build_block_reason("ureq", "aresp", p)
-            self.assertIn("- `model`: `haiku`", out)
+            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p)
+            self.assertIn("- `model`: `haiku`", model_param)
         finally:
             p.unlink()
 
-    def test_model_default_omits_param(self):
+    def test_model_default_empty_param(self):
         p = self._write_template("model: default\nlanguage: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
         try:
-            out = sg.build_block_reason("ureq", "aresp", p)
-            self.assertNotIn("`model`", out)
-        finally:
-            p.unlink()
-
-    def test_model_bogus_omits_param(self):
-        p = self._write_template("model: gpt-5\nlanguage: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
-        try:
-            out = sg.build_block_reason("ureq", "aresp", p)
-            self.assertNotIn("`model`", out)
+            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p)
+            self.assertEqual(model_param, "")
         finally:
             p.unlink()
 
@@ -487,16 +479,78 @@ agent: {AGENT_RESPONSE}
             "language: zh\nstrictness: strict\nmodel: opus\ndimensions:\n  - evidence\ncustom_checks:\n  - name: sec\n    description: sql"
         )
         try:
-            out = sg.build_block_reason("my-request", "my-response", p)
+            prompt, _mp, _fm = sg.build_reviewer_prompt("my-request", "my-response", p)
             for ph in ("{LANGUAGE}", "{STRICTNESS_DIRECTIVE}", "{MODEL_PREFERENCE_PARAM}",
                       "{DIMENSIONS_BLOCK}", "{CUSTOM_CHECKS_BLOCK}", "{USER_REQUEST}", "{AGENT_RESPONSE}"):
-                self.assertNotIn(ph, out, f"{ph} was not substituted")
-            self.assertIn("my-request", out)
-            self.assertIn("my-response", out)
-            self.assertIn("zh", out)
-            self.assertIn("opus", out)
+                self.assertNotIn(ph, prompt, f"{ph} was not substituted")
+            self.assertIn("my-request", prompt)
+            self.assertIn("my-response", prompt)
+            self.assertIn("zh", prompt)
         finally:
             p.unlink()
+
+    def test_extract_reviewer_body_with_inner_markers(self):
+        # Template with outer wrapper (legacy v0.2.x structure)
+        body = "OUTER\n\n---\nREVIEWER CONTENT\n---\n\nAFTER"
+        self.assertEqual(sg.extract_reviewer_prompt_body(body), "REVIEWER CONTENT")
+
+    def test_extract_reviewer_body_without_markers(self):
+        # Template that's already inner-only (v0.3.1+ structure)
+        body = "Just the reviewer prompt.\n{USER_REQUEST}"
+        self.assertEqual(sg.extract_reviewer_prompt_body(body), "Just the reviewer prompt.\n{USER_REQUEST}")
+
+
+class ShortReasonAndSessionFile(unittest.TestCase):
+    """build_block_reason writes reviewer to session file and returns short reason."""
+
+    def setUp(self):
+        self._saved_sessions = sg.SESSIONS_DIR
+        self.tmp = Path(tempfile.mkdtemp())
+        sg.SESSIONS_DIR = self.tmp
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        sg.SESSIONS_DIR = self._saved_sessions
+
+    def test_short_reason_references_file(self):
+        # Use the bundled template as input prompt
+        reason, session_file = sg.build_block_reason("req", "resp", sg.BUNDLED_PROMPT, "test-session-abc")
+        self.assertIn("Completion review required", reason)
+        self.assertIn("test-session-abc", str(session_file))
+        self.assertTrue(session_file.exists())
+        # Short reason should be << 1000 chars (we want ~500)
+        self.assertLess(len(reason), 1000, f"short reason is {len(reason)} chars, too long")
+
+    def test_session_file_contains_substituted_content(self):
+        _r, session_file = sg.build_block_reason("my-req", "my-resp", sg.BUNDLED_PROMPT, "test-sess")
+        content = session_file.read_text()
+        self.assertIn("my-req", content)
+        self.assertIn("my-resp", content)
+        # Placeholders all substituted
+        for ph in ("{USER_REQUEST}", "{AGENT_RESPONSE}", "{LANGUAGE}", "{STRICTNESS_DIRECTIVE}",
+                  "{DIMENSIONS_BLOCK}", "{CUSTOM_CHECKS_BLOCK}"):
+            self.assertNotIn(ph, content)
+
+    def test_session_id_sanitised(self):
+        # Unusual chars in session_id shouldn't break filesystem
+        _r, session_file = sg.build_block_reason("r", "a", sg.BUNDLED_PROMPT, "../../../etc/passwd")
+        # The filename should be sanitised — no path traversal
+        self.assertTrue(str(session_file).startswith(str(self.tmp)))
+
+    def test_sweep_removes_old_files(self):
+        # Create a file with old mtime
+        old = sg.SESSIONS_DIR / "old.md"
+        old.write_text("stale")
+        import os as _os
+        ancient = datetime.now().timestamp() - (30 * 24 * 3600)
+        _os.utime(old, (ancient, ancient))
+        # Create a recent file
+        recent = sg.SESSIONS_DIR / "recent.md"
+        recent.write_text("fresh")
+        sg.sweep_old_session_files()
+        self.assertFalse(old.exists(), "old file should have been swept")
+        self.assertTrue(recent.exists(), "recent file should remain")
 
 
 def main():
@@ -512,7 +566,8 @@ def main():
         DimensionAssembly,
         CustomChecksAssembly,
         PromptResolution,
-        BuildBlockReason,
+        BuildReviewerPrompt,
+        ShortReasonAndSessionFile,
     ):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=verbosity)

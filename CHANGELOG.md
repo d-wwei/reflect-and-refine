@@ -4,6 +4,29 @@ All notable changes to `reflect-and-refine` are recorded here. Format follows [K
 
 ## [Unreleased]
 
+### Changed — file-based reviewer prompt (v0.3.1)
+Cuts user-visible terminal noise per block by ~60%. The hook no longer
+injects the full reviewer prompt inline — it writes the substituted
+prompt to `~/.reflect-and-refine/sessions/<session-id>.md` and emits a
+short reason (~770 chars, was ~1940) that tells the main agent: "Call
+Task with prompt = read that file and return only the verdict JSON".
+The Task subagent reads the file directly, keeping the main agent's
+Task invocation short too.
+
+Per-session files self-clean after 7 days (sweep on every hook fire).
+
+Legacy prompt files with the old outer-`---`/inner-`---` wrapper
+structure still work — `extract_reviewer_prompt_body()` detects the
+two inner markers and uses only the content between them. All four
+bundled scenario files (coding/testing/debugging/general) and the
+reviewer-template.md fallback have been simplified to inner-only
+structure so they read cleanly.
+
+Audit log adds `session_file`, `short_reason_chars`, and
+`reviewer_file_chars` fields.
+
+## [0.2.2 / 0.3.0 retrospective]
+
 ### Added — scenario-based prompt binding (major architectural change)
 - **Scenario layer** between skills and reviewer prompts. Reviewer prompts are now bound to workflow scenarios (`coding`, `testing`, `debugging`, `general`), not to skill names directly. `skill_scenario_map` in config.json maps skill → scenario; the hook resolves the prompt via scenario lookup. Downstream benefit: a new coding skill just needs a map entry, not a new prompt file.
 - **3 specialised bundled scenarios** (`coding.md`, `testing.md`, `debugging.md`) written precisely — each has domain-specific role text + dimension selection + custom_checks. `general.md` ships as a baseline.

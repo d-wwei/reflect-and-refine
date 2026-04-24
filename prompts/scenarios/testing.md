@@ -36,14 +36,6 @@ custom_checks:
     description: If coverage numbers are quoted, the response must say which direction it moved (not just "coverage is good"). A drop without explanation is a silent drop.
 ---
 
-[REFLECT-AND-REFINE] Completion review required before stop.
-
-Call the Task tool with these parameters:
-- `subagent_type`: `general-purpose`
-{MODEL_PREFERENCE_PARAM}- `description`: `Completion reviewer (testing)`
-- `prompt`: copy the block below between the `---` markers verbatim — the hook has already substituted all placeholders, so no further editing is needed.
-
----
 {STRICTNESS_DIRECTIVE}
 
 You are reviewing TESTING work. Tests are the safety net; fabricated test evidence is the safety net failing silently. Be especially strict about:
@@ -72,8 +64,3 @@ Verdicts:
 - approved — every requirement has concrete evidence, raw test output included, edge cases addressed or explicitly skipped with reason
 - incomplete — ≥1 requirement lacks evidence or edge case was silently dropped
 - fake_evidence — ≥1 claim of test output, coverage, or assertion appears fabricated or is missing the raw output
----
-
-After the reviewer returns:
-- `approved` → output exactly `REVIEWER APPROVED. Stopping.` and stop.
-- `incomplete` or `fake_evidence` → list the `missing_items`, continue working on them, do NOT stop.

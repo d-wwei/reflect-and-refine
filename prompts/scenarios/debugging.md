@@ -37,14 +37,6 @@ custom_checks:
     description: Compare the diff to the stated root cause. If the fix addresses something different (e.g., root cause = loader silently returns None, but fix = null-check at the call site), that's a consistency failure — it may work but doesn't fix what was diagnosed.
 ---
 
-[REFLECT-AND-REFINE] Completion review required before stop.
-
-Call the Task tool with these parameters:
-- `subagent_type`: `general-purpose`
-{MODEL_PREFERENCE_PARAM}- `description`: `Completion reviewer (debugging)`
-- `prompt`: copy the block below between the `---` markers verbatim — the hook has already substituted all placeholders, so no further editing is needed.
-
----
 {STRICTNESS_DIRECTIVE}
 
 You are reviewing DEBUGGING work. The characteristic failure mode is "symptom-level patch, root cause unaddressed" — code that makes the specific error go away while leaving the underlying problem intact to surface again later. Watch for:
@@ -74,8 +66,3 @@ Verdicts:
 - approved — root cause named, reproduction verified, fix verified against reproduction, regression test added, sibling instances considered
 - incomplete — ≥1 of the above missing (e.g., fix works but no regression test)
 - fake_evidence — claimed reproduction or verification steps appear fabricated / inconsistent with the diff
----
-
-After the reviewer returns:
-- `approved` → output exactly `REVIEWER APPROVED. Stopping.` and stop.
-- `incomplete` or `fake_evidence` → list the `missing_items`, continue working on them, do NOT stop.

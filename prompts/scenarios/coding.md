@@ -37,14 +37,6 @@ custom_checks:
     description: Cross-check file paths, imported symbols, and function names mentioned in the response. Any path or name that's implausible given the codebase context counts as fake_evidence.
 ---
 
-[REFLECT-AND-REFINE] Completion review required before stop.
-
-Call the Task tool with these parameters:
-- `subagent_type`: `general-purpose`
-{MODEL_PREFERENCE_PARAM}- `description`: `Completion reviewer (coding)`
-- `prompt`: copy the block below between the `---` markers verbatim — the hook has already substituted all placeholders, so no further editing is needed.
-
----
 {STRICTNESS_DIRECTIVE}
 
 You are reviewing CODE-CHANGE work. Your highest-value targets are the three shortcuts agents take under time pressure:
@@ -72,8 +64,3 @@ Verdicts:
 - approved — every requirement has concrete, non-hedged evidence; tests/builds demonstrably ran
 - incomplete — ≥1 requirement lacks evidence or was skipped
 - fake_evidence — ≥1 claim of test output, build success, or file reference appears fabricated
----
-
-After the reviewer returns:
-- `approved` → output exactly `REVIEWER APPROVED. Stopping.` and stop.
-- `incomplete` or `fake_evidence` → list the `missing_items`, continue working on them, do NOT stop.

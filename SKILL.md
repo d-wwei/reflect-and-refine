@@ -7,7 +7,7 @@ description: |
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
   protocols. Works standalone; integrates loosely with any parent skill via registration.
-  Subcommands: status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin, map.
+  Subcommands: configure, status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin, map.
 ---
 
 # Reflect and Refine
@@ -39,6 +39,94 @@ Query/config subcommands of reflect-and-refine itself are intentionally transpar
 There is no time-window expiry by default — activation persists until you explicitly shut it down or start a new session.
 
 ## Subcommands
+
+### `/reflect-and-refine configure`
+
+**One-stop control panel**. Fully interactive — use this when you're not sure which specific subcommand to run. Shows the live state, offers one-click enable/disable, per-skill toggle, scenario mapping adjustment, and global pause/unpause.
+
+**Dialog flow**:
+
+1. **Read current state** — main agent runs:
+   ```bash
+   jq . ~/.reflect-and-refine/config.json
+   ls -la ~/.reflect-and-refine/.paused 2>&1  # existence of pause flag
+   ls ~/.claude/skills/                       # all installed skills
+   ls ~/.better-work-series/reflect-and-refine/prompts/scenarios/  # available scenarios (bundled)
+   ls ~/.reflect-and-refine/prompts/scenarios/ 2>&1  # available scenarios (user)
+   ```
+
+2. **Present summary** like:
+   ```
+   === reflect-and-refine · current state ===
+   Gate:           [ACTIVE | PAUSED via ~/.reflect-and-refine/.paused]
+   Rate limit:     3 blocks / user turn
+   Registered skills (3) — these auto-trigger the gate:
+     ✓ better-code    → coding
+     ✓ better-test    → testing
+     ✓ better-work    → general
+   Other skills at ~/.claude/skills/ not registered (N):
+     ○ great-writer
+     ○ cognitive-kernel
+     ○ labloop
+     ○ ...
+   Available scenarios: coding, testing, debugging, general (+ any user-added)
+   ```
+
+3. **Offer these options** (numbered list; let user pick one or "quit"):
+
+   | # | Option | Effect |
+   |---|--------|--------|
+   | 1 | **Toggle individual skills** | Checklist UI: for each skill in `~/.claude/skills/`, show ✓ or ○; user flips as many as wanted; confirm before writing |
+   | 2 | **Enable all detected skills** | Add every skill under `~/.claude/skills/` to `registered_skills`; default-map unmapped ones to `general` |
+   | 3 | **Disable all** | Clear `registered_skills` to `[]`; gate will be CLOSED everywhere until you re-register something |
+   | 4 | **Change scenario mapping** | For each registered skill show current scenario; ask which to change; offer `coding / testing / debugging / general / <new>` |
+   | 5 | **Pause the hook globally** | `touch ~/.reflect-and-refine/.paused`; all sessions silent until unpause |
+   | 6 | **Unpause** | `rm ~/.reflect-and-refine/.paused` |
+   | 7 | **Adjust rate limit** | Short-circuit to `/reflect-and-refine rate-limit <N>` logic |
+   | 8 | **Cancel** | Exit without changes |
+
+4. **Apply change** — after user picks, run the sub-dialog for that option. Each sub-dialog ends with **preview + confirm** before writing anything. All changes use `jq` merge that preserves unknown fields in `config.json`.
+
+5. **Show new state** — after applying, re-display the summary so user confirms the change landed.
+
+6. **Offer follow-up** — "Anything else? (back to main menu / done)"
+
+**Sub-dialog details**:
+
+**Option 1 — Toggle individual**:
+- Show each skill in `~/.claude/skills/` as `[✓|○] <name>  (scenario: <mapped-or-unmapped>)`.
+- Let user type a list of skill names to flip (or numbers if listed with indices).
+- For each skill being ENABLED that has no scenario mapping, ask "which scenario?" (default: general).
+- Write via jq merge.
+
+**Option 2 — Enable all**:
+- List everything about to be registered.
+- Warn: "this will run reflect-and-refine's review on EVERY skill invocation. Token cost and review latency will scale accordingly."
+- Confirm before applying. Default-map to `general` for skills without an existing mapping.
+
+**Option 3 — Disable all**:
+- Warn: "after this, no slash command will auto-trigger reflect-and-refine. You'll need to re-register or re-run `configure` to turn it back on."
+- Confirm. Write `registered_skills: []` via jq.
+
+**Option 4 — Scenario mapping**:
+- For each registered skill, display `<skill> → <current scenario>` (or `(unmapped)`).
+- Ask: "Which skill's mapping do you want to change? (name or 'done')".
+- For the chosen skill, offer available scenarios + "new" (type new name) + "unmap".
+- Write via jq merge into `reviewer.skill_scenario_map`.
+
+**Option 5/6 — Pause/Unpause**:
+- Simple: touch or rm the flag file, report success.
+
+**Option 7 — Rate limit**:
+- Ask for N.
+- Apply the same validation as `/reflect-and-refine rate-limit`: reject 0/negative, accept 1–5 silent, 6–20 warn, >20 require `--force`.
+
+**Principles** (same as customize):
+- Never assume. Ask.
+- Show defaults on every question.
+- Allow back-stepping.
+- Confirm before writing.
+- All writes via jq merge — preserve unknown fields.
 
 ### `/reflect-and-refine activate`
 Open the gate in this session without invoking another skill. A no-op convenience command —

@@ -52,6 +52,21 @@ Activate in a session:
 
 Any subsequent stop will trigger the review until you `/reflect-and-refine shutdown`.
 
+### Quick-start control panel
+
+```
+/reflect-and-refine configure
+```
+
+One interactive wizard covers everything most users need:
+- Toggle which skills auto-trigger the gate
+- Enable all installed skills at once (or disable all)
+- Change the scenario mapping (which prompt each skill uses)
+- Pause or unpause the hook globally
+- Adjust the per-turn rate limit
+
+Use this if you're unsure which specific subcommand to run.
+
 ### Install with parent skills pre-registered
 
 ```bash
@@ -67,7 +82,8 @@ After this, invoking `/better-work`, `/better-code`, or `/better-test` will also
 | `/reflect-and-refine activate` | Open the gate in this session (marker-only; no state file) |
 | `/reflect-and-refine shutdown` | Close the gate until re-activated |
 | `/reflect-and-refine status` | Show registry, rate limit, current turn block count |
-| `/reflect-and-refine register <name> ...` | Append skills to the registry |
+| **`/reflect-and-refine configure`** | **Interactive control panel — toggle skills on/off, enable/disable all, change scenario mapping, pause/unpause. Best starting point if unsure.** |
+| `/reflect-and-refine register <name> ...` | Append skills to the registry (CLI-style shortcut for `configure → option 1`) |
 | `/reflect-and-refine unregister <name> ...` | Remove skills from the registry |
 | `/reflect-and-refine rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
 | `/reflect-and-refine audit [<N>]` | Print last N audit entries (default 5). See `~/.reflect-and-refine/audit.md` for full history. |

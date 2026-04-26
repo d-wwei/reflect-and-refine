@@ -171,6 +171,18 @@ class GateStateSemantics(unittest.TestCase):
             ("CLOSED", ""),
         )
 
+    def test_configure_transparent(self):
+        self.assertEqual(
+            sg.gate_state([_mk_user_rec("reflect-and-refine", "configure")], REGISTERED),
+            ("CLOSED", ""),
+        )
+
+    def test_map_transparent(self):
+        self.assertEqual(
+            sg.gate_state([_mk_user_rec("reflect-and-refine", "map better-code coding")], REGISTERED),
+            ("CLOSED", ""),
+        )
+
     def test_shutdown_then_query_stays_closed(self):
         seq = [
             _mk_user_rec("better-code", "init"),

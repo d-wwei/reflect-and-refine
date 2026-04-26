@@ -99,6 +99,7 @@ VALID_REVIEWER_MODELS = {"haiku", "sonnet", "opus"}
 # transparent to gate state.
 IDEMPOTENT_RAR_SUBCOMMANDS = {
     "status", "audit", "rate-limit", "register", "unregister", "customize",
+    "configure", "map",
     # pin/unpin affect WHICH skill activates but don't themselves open/close
     # the gate — they're directives scanned separately by find_pinned_skill.
     "pin", "unpin",

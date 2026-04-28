@@ -21,6 +21,8 @@ Coverage:
 import importlib.util
 import json
 import os
+import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -121,6 +123,10 @@ class GateStateSemantics(unittest.TestCase):
             ("OPEN", "better-code"),
         )
 
+    def test_plain_slash_command_opens(self):
+        seq = [{"type": "user", "timestamp": "2026-04-23T01:00:00Z", "message": {"role": "user", "content": "/better-code init"}}]
+        self.assertEqual(sg.gate_state(seq, REGISTERED), ("OPEN", "better-code"))
+
     def test_rar_shutdown_closes(self):
         self.assertEqual(
             sg.gate_state([_mk_user_rec("reflect-and-refine", "shutdown")], REGISTERED),
@@ -207,6 +213,10 @@ class GateStateSemantics(unittest.TestCase):
             _mk_user_rec("better-test", "strategy"),
         ]
         self.assertEqual(sg.gate_state(seq, REGISTERED), ("OPEN", "better-test"))
+
+    def test_activate_works_with_empty_registry(self):
+        seq = [_mk_user_rec("reflect-and-refine", "activate")]
+        self.assertEqual(sg.gate_state(seq, set()), ("OPEN", "reflect-and-refine"))
 
     def test_no_markers_closed(self):
         seq = [_mk_plain_user("hello there")]
@@ -295,6 +305,124 @@ class ScenarioLookup(unittest.TestCase):
     def test_nondict_map_returns_empty(self):
         cfg = {"reviewer": {"skill_scenario_map": "garbage"}}
         self.assertEqual(sg.scenario_for_skill("better-code", cfg), "")
+
+
+class StopIntentClassification(unittest.TestCase):
+    def test_final_completion_detected(self):
+        self.assertEqual(
+            sg.classify_stop_intent("fix bug", "Implemented the change and tests passed."),
+            "final_completion",
+        )
+
+    def test_checkpoint_detected(self):
+        self.assertEqual(
+            sg.classify_stop_intent("fix bug", "Progress update: not finished yet. Remaining: add regression test. Next step: rerun suite."),
+            "checkpoint_update",
+        )
+
+    def test_blocked_detected(self):
+        self.assertEqual(
+            sg.classify_stop_intent("fix bug", "I'm blocked waiting for database credentials and cannot continue until I get access."),
+            "blocked_external",
+        )
+
+    def test_needs_user_decision_detected(self):
+        self.assertEqual(
+            sg.classify_stop_intent("build feature", "I can implement this as a sync job or a request-time path. Which option do you want?"),
+            "needs_user_decision",
+        )
+
+
+class TriggerModeSemantics(unittest.TestCase):
+    def test_default_trigger_mode(self):
+        self.assertEqual(sg.trigger_mode_for_scenario("general", {}), "intent_sensitive")
+
+    def test_scenario_override(self):
+        cfg = {
+            "reviewer": {
+                "trigger_mode": "intent_sensitive",
+                "trigger_mode_by_scenario": {"coding": "claim_done_only"},
+            }
+        }
+        self.assertEqual(sg.trigger_mode_for_scenario("coding", cfg), "claim_done_only")
+
+    def test_claim_done_only_skips_checkpoint(self):
+        self.assertFalse(sg.should_review_stop_intent("checkpoint_update", "claim_done_only"))
+
+    def test_claim_done_only_allows_final(self):
+        self.assertTrue(sg.should_review_stop_intent("final_completion", "claim_done_only"))
+
+
+class TranscriptNormalization(unittest.TestCase):
+    def test_codex_user_message_is_real(self):
+        rec = {
+            "timestamp": "2026-04-27T10:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "/reflect-and-refine activate"}],
+            },
+        }
+        self.assertTrue(sg.is_real_user_record(rec))
+
+    def test_codex_assistant_text_extracted(self):
+        records = [
+            {
+                "timestamp": "2026-04-27T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "/better-code init"}],
+                },
+            },
+            {
+                "timestamp": "2026-04-27T10:00:05Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            },
+        ]
+        req, resp = sg.last_user_command_parts(records)
+        self.assertEqual(req, "/better-code init")
+        self.assertEqual(resp, "done")
+
+    def test_last_user_command_parts_uses_fallback_assistant_text(self):
+        records = [
+            {
+                "timestamp": "2026-04-27T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "/reflect-and-refine activate"}],
+                },
+            }
+        ]
+        req, resp = sg.last_user_command_parts(records, fallback_assistant_text="final reply")
+        self.assertEqual(req, "/reflect-and-refine activate")
+        self.assertEqual(resp, "final reply")
+
+    def test_extract_plain_slash_command(self):
+        self.assertEqual(
+            sg.extract_command_invocation("/reflect-and-refine activate"),
+            ("reflect-and-refine", "activate"),
+        )
+
+
+class MaxBlocksValidation(unittest.TestCase):
+    def test_invalid_non_numeric_falls_back(self):
+        self.assertEqual(sg.sanitize_max_blocks("oops"), (sg.DEFAULT_MAX_BLOCKS_PER_TURN, True))
+
+    def test_zero_falls_back(self):
+        self.assertEqual(sg.sanitize_max_blocks(0), (sg.DEFAULT_MAX_BLOCKS_PER_TURN, True))
+
+    def test_positive_value_kept(self):
+        self.assertEqual(sg.sanitize_max_blocks(5), (5, False))
 
 
 class DimensionAssembly(unittest.TestCase):
@@ -473,7 +601,7 @@ agent: {AGENT_RESPONSE}"""
     def test_model_haiku_in_returned_param(self):
         p = self._write_template("model: haiku\nlanguage: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
         try:
-            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p)
+            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p, "final_completion")
             self.assertIn("- `model`: `haiku`", model_param)
         finally:
             p.unlink()
@@ -481,7 +609,7 @@ agent: {AGENT_RESPONSE}"""
     def test_model_default_empty_param(self):
         p = self._write_template("model: default\nlanguage: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
         try:
-            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p)
+            _prompt, model_param, _fm = sg.build_reviewer_prompt("u", "a", p, "final_completion")
             self.assertEqual(model_param, "")
         finally:
             p.unlink()
@@ -491,13 +619,23 @@ agent: {AGENT_RESPONSE}"""
             "language: zh\nstrictness: strict\nmodel: opus\ndimensions:\n  - evidence\ncustom_checks:\n  - name: sec\n    description: sql"
         )
         try:
-            prompt, _mp, _fm = sg.build_reviewer_prompt("my-request", "my-response", p)
+            prompt, _mp, _fm = sg.build_reviewer_prompt("my-request", "my-response", p, "final_completion")
             for ph in ("{LANGUAGE}", "{STRICTNESS_DIRECTIVE}", "{MODEL_PREFERENCE_PARAM}",
                       "{DIMENSIONS_BLOCK}", "{CUSTOM_CHECKS_BLOCK}", "{USER_REQUEST}", "{AGENT_RESPONSE}"):
                 self.assertNotIn(ph, prompt, f"{ph} was not substituted")
             self.assertIn("my-request", prompt)
             self.assertIn("my-response", prompt)
             self.assertIn("zh", prompt)
+        finally:
+            p.unlink()
+
+    def test_checkpoint_uses_intent_template(self):
+        p = self._write_template("language: en\nstrictness: default\ndimensions: []\ncustom_checks: []\nfocus: code changes")
+        try:
+            prompt, _mp, meta = sg.build_reviewer_prompt("req", "progress update: not finished", p, "checkpoint_update")
+            self.assertIn("checkpoint_ok", prompt)
+            self.assertIn("code changes", prompt)
+            self.assertEqual(meta["_stop_intent"], "checkpoint_update")
         finally:
             p.unlink()
 
@@ -527,15 +665,16 @@ class ShortReasonAndSessionFile(unittest.TestCase):
 
     def test_short_reason_references_file(self):
         # Use the bundled template as input prompt
-        reason, session_file = sg.build_block_reason("req", "resp", sg.BUNDLED_PROMPT, "test-session-abc")
+        reason, session_file = sg.build_block_reason("req", "resp", sg.BUNDLED_PROMPT, "test-session-abc", "claude", "final_completion")
         self.assertIn("Completion review required", reason)
+        self.assertIn("final_completion", reason)
         self.assertIn("test-session-abc", str(session_file))
         self.assertTrue(session_file.exists())
         # Short reason should be << 1000 chars (we want ~500)
         self.assertLess(len(reason), 1000, f"short reason is {len(reason)} chars, too long")
 
     def test_session_file_contains_substituted_content(self):
-        _r, session_file = sg.build_block_reason("my-req", "my-resp", sg.BUNDLED_PROMPT, "test-sess")
+        _r, session_file = sg.build_block_reason("my-req", "my-resp", sg.BUNDLED_PROMPT, "test-sess", "claude", "final_completion")
         content = session_file.read_text()
         self.assertIn("my-req", content)
         self.assertIn("my-resp", content)
@@ -546,7 +685,7 @@ class ShortReasonAndSessionFile(unittest.TestCase):
 
     def test_session_id_sanitised(self):
         # Unusual chars in session_id shouldn't break filesystem
-        _r, session_file = sg.build_block_reason("r", "a", sg.BUNDLED_PROMPT, "../../../etc/passwd")
+        _r, session_file = sg.build_block_reason("r", "a", sg.BUNDLED_PROMPT, "../../../etc/passwd", "claude", "final_completion")
         # The filename should be sanitised — no path traversal
         self.assertTrue(str(session_file).startswith(str(self.tmp)))
 
@@ -565,6 +704,213 @@ class ShortReasonAndSessionFile(unittest.TestCase):
         self.assertTrue(recent.exists(), "recent file should remain")
 
 
+class InstallerScripts(unittest.TestCase):
+    def test_uninstall_purge_removes_claude_hook(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            home = tmp / "home"
+            settings_dir = home / ".claude"
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            hook_cmd = f"python3 {HOOK}"
+            (settings_dir / "settings.json").write_text(json.dumps({
+                "hooks": {
+                    "Stop": [{
+                        "matcher": "*",
+                        "hooks": [{"type": "command", "command": hook_cmd, "timeout": 30}],
+                    }]
+                }
+            }))
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                ["bash", str(REPO / "uninstall.sh"), "--purge"],
+                cwd=REPO,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            settings = json.loads((settings_dir / "settings.json").read_text())
+            stop_hooks = settings.get("hooks", {}).get("Stop", [])
+            self.assertFalse(stop_hooks, result.stdout + result.stderr)
+            self.assertFalse((home / ".reflect-and-refine").exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_install_can_enable_codex_flag_and_hook(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            home = tmp / "home"
+            (home / ".claude").mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["CODEX_HOME"] = str(home / ".codex")
+            result = subprocess.run(
+                ["bash", str(REPO / "install.sh"), "--enable-codex-feature-flag"],
+                cwd=REPO,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            hooks_json = json.loads((home / ".codex" / "hooks.json").read_text())
+            self.assertTrue(
+                any(
+                    hook.get("command") == f"python3 {HOOK}"
+                    for group in hooks_json.get("hooks", {}).get("Stop", [])
+                    for hook in group.get("hooks", [])
+                ),
+                result.stdout + result.stderr,
+            )
+            config_text = (home / ".codex" / "config.toml").read_text()
+            self.assertIn("codex_hooks = true", config_text)
+
+            installed_cfg = json.loads((home / ".reflect-and-refine" / "config.json").read_text())
+            self.assertEqual(installed_cfg["reviewer"]["trigger_mode_by_scenario"]["coding"], "claim_done_only")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class StopHookMainFlow(unittest.TestCase):
+    def test_codex_payload_blocks_with_codex_reason(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            home = tmp / "home"
+            session_id = f"codex-test-session-{tmp.name}"
+            state_file = Path(f"/tmp/rar-{session_id}.state")
+            if state_file.exists():
+                state_file.unlink()
+            transcript = tmp / "transcript.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-04-27T10:00:00Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "/reflect-and-refine activate"}],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-04-27T10:00:05Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "done"}],
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            config_dir = home / ".reflect-and-refine"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "registered_skills": [],
+                        "max_blocks_per_turn": 3,
+                        "suppress_output": True,
+                        "reviewer": {"skill_scenario_map": {}, "per_skill": {}, "trigger_mode": "intent_sensitive"},
+                    }
+                )
+            )
+
+            payload = {
+                "session_id": session_id,
+                "transcript_path": str(transcript),
+                "hook_event_name": "Stop",
+                "turn_id": "turn-codex-1",
+                "last_assistant_message": "done",
+            }
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                ["python3", str(HOOK)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+            out = json.loads(result.stdout)
+            self.assertEqual(out["decision"], "block")
+            self.assertIn("Adversarial Review (in-turn)", out["reason"])
+            self.assertNotIn("Call the Task tool", out["reason"])
+            self.assertIn("final_completion", out["reason"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_claim_done_only_skips_checkpoint_stop(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            home = tmp / "home"
+            session_id = f"claim-done-only-{tmp.name}"
+            state_file = Path(f"/tmp/rar-{session_id}.state")
+            if state_file.exists():
+                state_file.unlink()
+            transcript = tmp / "transcript.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(_mk_user_rec("better-code", "init")),
+                        json.dumps({"type": "assistant", "timestamp": "2026-04-27T10:00:05Z", "message": {"role": "assistant", "content": "Progress update: not finished yet. Remaining: add tests. Next step: rerun suite."}}),
+                    ]
+                )
+                + "\n"
+            )
+
+            config_dir = home / ".reflect-and-refine"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "registered_skills": ["better-code"],
+                        "max_blocks_per_turn": 3,
+                        "suppress_output": True,
+                        "reviewer": {
+                            "skill_scenario_map": {"better-code": "coding"},
+                            "per_skill": {},
+                            "trigger_mode": "intent_sensitive",
+                            "trigger_mode_by_scenario": {"coding": "claim_done_only"},
+                        },
+                    }
+                )
+            )
+
+            payload = {
+                "session_id": session_id,
+                "transcript_path": str(transcript),
+            }
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                ["python3", str(HOOK)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+            self.assertEqual(result.stdout.strip(), "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     verbosity = 1 if "-q" in sys.argv else 2
     loader = unittest.TestLoader()
@@ -575,11 +921,17 @@ def main():
         GateStateSemantics,
         PinDirective,
         ScenarioLookup,
+        StopIntentClassification,
+        TriggerModeSemantics,
+        TranscriptNormalization,
+        MaxBlocksValidation,
         DimensionAssembly,
         CustomChecksAssembly,
         PromptResolution,
         BuildReviewerPrompt,
         ShortReasonAndSessionFile,
+        InstallerScripts,
+        StopHookMainFlow,
     ):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=verbosity)

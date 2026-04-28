@@ -1,8 +1,8 @@
 # reflect-and-refine
 
-Adversarial completion review at Stop time for Claude Code agents.
+Adversarial completion review at Stop time for Claude Code and Codex agents.
 
-When the main agent tries to claim "done", a Stop hook forces it to spawn an **independent reviewer sub-agent** that audits whether the user's original request is actually complete with concrete evidence. The reviewer has no skin in the game, sees only the facts (request + response), and must return a structured verdict.
+When the main agent tries to claim "done", a Stop hook forces an **independent adversarial review step** that audits whether the user's original request is actually complete with concrete evidence. On Claude Code this is a reviewer sub-agent; on Codex it is a runtime-native reviewer when available, otherwise an explicit in-turn review. The reviewer sees only the facts (request + response) and must return a structured verdict.
 
 If the verdict is `incomplete` or `fake_evidence`, the agent is told to continue. Only `approved` lets it stop.
 
@@ -27,9 +27,26 @@ The default registry contains only `reflect-and-refine` itself. Parent skills (l
 
 No time window by default — once activated, the gate stays open until you `shutdown` or start a new session.
 
+Once the gate is open, the hook also classifies the **stop intent** before choosing the review path:
+
+- `final_completion`
+- `checkpoint_update`
+- `needs_user_decision`
+- `blocked_external`
+- `exploratory_pause`
+
+Built-in trigger defaults are quieter for long coding/testing sessions:
+
+- `coding` → `claim_done_only`
+- `testing` → `claim_done_only`
+- `debugging` → `intent_sensitive`
+- `general` → `intent_sensitive`
+
+So a mid-stream checkpoint in a coding/testing flow is no longer treated the same way as a claimed final completion.
+
 ## Install (standalone)
 
-Requires: `jq`, `python3`, Claude Code.
+Requires: `jq`, `python3`, Claude Code and/or Codex.
 
 ```bash
 git clone https://github.com/d-wwei/reflect-and-refine.git
@@ -37,14 +54,20 @@ cd reflect-and-refine
 ./install.sh
 ```
 
-Then **exit and restart Claude Code**:
+To also enable Codex's experimental hook runtime during install:
 
 ```bash
-/exit
-claude
+./install.sh --enable-codex-feature-flag
 ```
 
-Activate in a session:
+Then restart the client(s) you use:
+
+```bash
+/exit && claude
+codex
+```
+
+Activate in a session. In Codex, send the same command as a normal prompt line:
 
 ```
 /reflect-and-refine activate
@@ -101,9 +124,31 @@ fi
 
 `reflect-and-refine` does not know about `better-work`; parents register themselves.
 
+## Trigger Modes
+
+- `always` — every eligible Stop is reviewed
+- `claim_done_only` — only `final_completion` stops are reviewed
+- `intent_sensitive` — final completion plus user-facing pauses (`checkpoint_update`, `needs_user_decision`, `blocked_external`) are reviewed; purely exploratory pauses are skipped
+
+Config example:
+
+```json
+{
+  "reviewer": {
+    "trigger_mode": "intent_sensitive",
+    "trigger_mode_by_scenario": {
+      "coding": "claim_done_only",
+      "testing": "claim_done_only",
+      "debugging": "intent_sensitive",
+      "general": "intent_sensitive"
+    }
+  }
+}
+```
+
 ## Emergency shutdown (from any shell)
 
-If the `/reflect-and-refine` slash command isn't available (e.g. you installed mid-session and the current Claude Code session can't see new skills), you still have two kill switches that work from outside Claude Code:
+If the `/reflect-and-refine` command isn't available in the current session yet, you still have two kill switches that work from outside the agent client:
 
 ```bash
 # Pause the hook (file-based kill switch — hook checks before any work)
@@ -113,11 +158,12 @@ rm ~/.reflect-and-refine/.paused
 ```
 
 ```bash
-# Per-launch override (env var — set before launching claude)
+# Per-launch override (env var — set before launching the client)
 RAR_DISABLED=1 claude
+RAR_DISABLED=1 codex
 ```
 
-Both are checked at the top of the hook script before transcript or config is read, so the override is cheap.
+Both are checked at the top of the hook script before transcript or config is read, so the override is cheap. They work for both Claude Code and Codex.
 
 ## Uninstall
 
@@ -126,13 +172,13 @@ Both are checked at the top of the hook script before transcript or config is re
 ./uninstall.sh --purge   # also deletes ~/.reflect-and-refine/
 ```
 
-Restart Claude Code for the removal to take effect.
+Restart Claude Code and Codex for the removal to take effect.
 
 ## Files
 
 ```
 reflect-and-refine/
-├── SKILL.md                   # skill entry (loaded by Claude Code)
+├── SKILL.md                   # skill entry (loaded by Claude Code and Codex)
 ├── install.sh / uninstall.sh  # cross-platform installer
 ├── hooks/
 │   └── stop-gate.py           # the hook script (invoked per Stop)
@@ -252,18 +298,18 @@ Events logged: `BLOCKED` (reason was injected), `RATE-LIMITED` (would have block
 
 ## Limitations
 
-- **Quiet by default**: the injected reviewer prompt is sent to the main agent's context but NOT rendered in the terminal (via `suppressOutput`). You'll see Claude Code's brief "Ran 1 stop hook" line instead of a 4000-character wall. To restore verbose terminal output, set `"suppress_output": false` in `~/.reflect-and-refine/config.json`.
+- **Quiet by default**: the injected reviewer prompt is sent to the main agent's context with `suppressOutput`. Claude Code currently collapses this well; Codex currently parses the field but may still show more hook output depending on runtime version.
 - **Main agent can still try to game the reviewer** by biasing the prompt it constructs. The hook pre-extracts transcript excerpts to reduce this; strong adversarial behavior needs prompt iteration over time.
-- **Reviewer costs tokens per Stop** while the gate is open. If the gate is open all session, every stop triggers a sub-agent call. Budget accordingly.
-- **Requires Claude Code session restart** to load/unload the hook (hooks are session-scope, not hot-reloadable).
-- **Cross-platform auth**: relies on `Task` tool being available in the main session, which uses the session's own auth. Does NOT spawn external `claude -p` processes, so Futu-internal builds work fine.
+- **Reviewer costs tokens per Stop** while the gate is open. If the gate is open all session, every stop triggers a review round. Budget accordingly.
+- **Requires client restart after install/uninstall** so the new skill / hook registration is picked up cleanly.
+- **Cross-platform reviewer execution**: Claude Code uses its native Task/sub-agent path. Codex uses a runtime-native reviewer if available, otherwise falls back to an explicit in-turn adversarial review before stop. This avoids depending on external `claude -p` subprocesses.
 - **Single-session state**: rate-limit counter is per session. Parallel sessions do not interfere.
 
 ## Design decisions
 
 See `docs/DESIGN.md` (TODO — extract from conversation log) for the full reasoning. High-level:
 
-- Chose Task sub-agent over `claude -p` subprocess → no auth/plumbing issues across Claude Code forks.
+- Chose runtime-native review over external `claude -p` subprocesses → less auth/plumbing fragility, and Codex can fall back to an in-turn review when no reviewer API exists.
 - Chose command-type Stop hook over prompt-type → prompt type has ecosystem coverage gaps; command type is universally supported.
 - Chose registry + transcript grep over flag files → activation happens automatically when parent skills are invoked, no manual `touch` needed.
 - Chose per-turn rate limit (3) over time-based → clear semantics, tied to user intent.

@@ -11,6 +11,7 @@
 language: en
 strictness: default
 model: default
+focus: code changes, verification quality, and resistance to fake test/build evidence
 
 # Dimensions chosen for code-change review. requirement_split and
 # silent_drops catch broken multi-file asks; evidence + fake_evidence
@@ -58,9 +59,9 @@ Check these dimensions:
 {CUSTOM_CHECKS_BLOCK}
 
 Return ONLY this JSON (no prose before or after, no code fencing):
-{"verdict":"approved"|"incomplete"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
+{"verdict":"approved"|"continue_work"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
 
 Verdicts:
 - approved — every requirement has concrete, non-hedged evidence; tests/builds demonstrably ran
-- incomplete — ≥1 requirement lacks evidence or was skipped
+- continue_work — ≥1 requirement lacks evidence or was skipped
 - fake_evidence — ≥1 claim of test output, build success, or file reference appears fabricated

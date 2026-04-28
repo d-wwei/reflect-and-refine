@@ -2,9 +2,9 @@
 """
 reflect-and-refine Stop hook gate.
 
-Reads Claude Code Stop hook JSON from stdin. Decides whether to:
+Reads Claude Code / Codex Stop hook JSON from stdin. Decides whether to:
 - exit 0 silently (gate closed or rate-limited), OR
-- emit a block JSON that instructs the main agent to run a reviewer sub-agent.
+- emit a block JSON that instructs the main agent to run a reviewer step.
 
 Fail-open: any uncaught exception results in exit 0 (we never block the user's
 stop due to our own bug). Errors are logged to ~/.reflect-and-refine/logs/.
@@ -29,10 +29,12 @@ SESSIONS_DIR = CONFIG_DIR / "sessions"
 USER_PROMPTS_DIR = CONFIG_DIR / "prompts"
 USER_OVERRIDES_DIR = USER_PROMPTS_DIR / "overrides"
 USER_SCENARIOS_DIR = USER_PROMPTS_DIR / "scenarios"
+USER_INTENTS_DIR = USER_PROMPTS_DIR / "intents"
 USER_DEFAULT_PROMPT = USER_PROMPTS_DIR / "default.md"
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 BUNDLED_PROMPT = SKILL_ROOT / "prompts" / "reviewer-template.md"
 BUNDLED_SCENARIOS_DIR = SKILL_ROOT / "prompts" / "scenarios"
+BUNDLED_INTENTS_DIR = SKILL_ROOT / "prompts" / "intents"
 
 # Retention for per-session reviewer-prompt files. Hook sweeps on each fire.
 SESSION_FILE_RETENTION_SECONDS = 7 * 24 * 3600  # 7 days
@@ -40,6 +42,10 @@ SESSION_FILE_RETENTION_SECONDS = 7 * 24 * 3600  # 7 days
 SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
 AUDIT_HEAD_MAX = 150  # chars to show in audit excerpts
+CONTROL_SKILL = "reflect-and-refine"
+DEFAULT_STOP_INTENT = "checkpoint_update"
+DEFAULT_TRIGGER_MODE = "intent_sensitive"
+VALID_TRIGGER_MODES = {"always", "claim_done_only", "intent_sensitive"}
 
 # Dimension snippets: {dimension_name: {strictness: text}}. Rendered into the
 # {DIMENSIONS_BLOCK} slot based on frontmatter config. Keep each snippet to
@@ -89,8 +95,8 @@ STRICTNESS_DIRECTIVES = {
 }
 
 # Valid enum values for the `model` frontmatter field. `default` / empty /
-# anything else we don't recognize causes the hook to omit the model param
-# so the main agent's Task tool picks the inherited model.
+# anything else we don't recognize causes the hook to omit the model hint
+# so the main agent falls back to the runtime's inherited/default model.
 VALID_REVIEWER_MODELS = {"haiku", "sonnet", "opus"}
 
 # Subcommands of /reflect-and-refine that are query/config — they MUST NOT
@@ -110,7 +116,7 @@ def log_error(msg: str) -> None:
     """
     Write to ~/.reflect-and-refine/logs/errors-YYYYMMDD.log AND emit a
     one-line stderr hint so the user has a visible signal something went
-    wrong. stderr from a Claude Code Stop hook is shown in the terminal
+    wrong. stderr from Stop hooks is shown in the terminal
     (exit code 2 would block, we use 0 here so it's non-blocking).
     """
     try:
@@ -184,6 +190,108 @@ def read_transcript(path: Path) -> list[dict]:
     return records
 
 
+def extract_message_text(content) -> str:
+    """
+    Normalize message content across Claude Code and Codex transcript shapes.
+
+    Supported forms:
+    - Claude Code: raw string content
+    - Claude/Codex: list of blocks with `text`
+    - Codex: message content blocks like {"type":"input_text","text":"..."}
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+            continue
+        nested = block.get("content")
+        if isinstance(nested, str) and nested:
+            parts.append(nested)
+    return "\n".join(parts).strip()
+
+
+def normalized_message_record(rec: dict) -> Optional[dict]:
+    """
+    Return a normalized message dict or None for non-message transcript entries.
+
+    Normalized shape:
+    {
+      "role": "user" | "assistant",
+      "timestamp": "...",
+      "content": "...",
+      "is_meta": bool,
+      "tool_result": any,
+    }
+    """
+    raw_type = rec.get("type")
+    if raw_type in {"user", "assistant"}:
+        message = rec.get("message", {})
+        return {
+            "role": raw_type,
+            "timestamp": rec.get("timestamp", ""),
+            "content": extract_message_text(message.get("content", "")),
+            "is_meta": rec.get("isMeta") is True,
+            "tool_result": rec.get("toolUseResult"),
+        }
+
+    if raw_type == "response_item":
+        payload = rec.get("payload", {})
+        if payload.get("type") != "message":
+            return None
+        role = payload.get("role")
+        if role not in {"user", "assistant"}:
+            return None
+        return {
+            "role": role,
+            "timestamp": rec.get("timestamp", ""),
+            "content": extract_message_text(payload.get("content", "")),
+            "is_meta": False,
+            "tool_result": None,
+        }
+
+    return None
+
+
+def extract_command_invocation(text: str) -> tuple[str, str]:
+    """
+    Extract a skill/control command from transcript text.
+
+    Supports:
+    - Claude Code slash-command markers:
+        <command-name>/skill</command-name>
+        <command-args>...</command-args>
+    - Plain slash commands captured as normal text:
+        /skill subcommand args
+    """
+    if not text:
+        return "", ""
+
+    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
+    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
+    m = name_pat.search(text)
+    if m:
+        args_match = args_pat.search(text)
+        args = args_match.group(1).strip() if args_match else ""
+        return m.group(1), args
+
+    stripped = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL).strip()
+    if not stripped:
+        return "", ""
+    first_line = stripped.splitlines()[0].strip()
+    m = re.match(r"^/([\w-]+)(?:\s+(.*))?$", first_line)
+    if not m:
+        return "", ""
+    return m.group(1), (m.group(2) or "").strip()
+
+
 def is_real_user_record(rec: dict) -> bool:
     """
     A 'real' user message is one typed/pasted by the human user, NOT:
@@ -191,15 +299,14 @@ def is_real_user_record(rec: dict) -> bool:
     - tool results (toolUseResult present)
     - sidechain / meta records
     """
-    if rec.get("type") != "user":
+    norm = normalized_message_record(rec)
+    if not norm or norm.get("role") != "user":
         return False
-    if rec.get("isMeta") is True:
+    if norm.get("is_meta") is True:
         return False
-    if rec.get("toolUseResult") is not None:
+    if norm.get("tool_result") is not None:
         return False
-    content = rec.get("message", {}).get("content", "")
-    if not isinstance(content, str):
-        # tool results often have list content; real user messages are strings
+    if not isinstance(norm.get("content", ""), str):
         return False
     return True
 
@@ -218,25 +325,20 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, s
     - /<any-other-registered-skill>             -> OPEN, triggered_skill=<skill>
     - no markers found                          -> CLOSED
     """
-    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
-    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
     for rec in reversed(records):
         if not is_real_user_record(rec):
             continue
-        content = rec["message"]["content"]
-        m = name_pat.search(content)
-        if not m:
+        norm = normalized_message_record(rec)
+        skill, args = extract_command_invocation(norm["content"] if norm else "")
+        if not skill:
             continue
-        skill = m.group(1)
-        args_match = args_pat.search(content)
-        args = args_match.group(1).strip() if args_match else ""
 
-        if skill == "reflect-and-refine":
+        if skill == CONTROL_SKILL:
             first_arg = args.split()[0] if args else ""
             if first_arg == SHUTDOWN_MARKER_ARGS:
                 return "CLOSED", ""
             if first_arg == "" or first_arg == "activate":
-                return "OPEN", "reflect-and-refine"
+                return "OPEN", CONTROL_SKILL
             if first_arg in IDEMPOTENT_RAR_SUBCOMMANDS:
                 continue  # query/config — transparent to gate state
             # Unknown subcommand (typo, new command we don't recognize): be
@@ -369,6 +471,147 @@ def scenario_for_skill(triggered_skill: str, config: dict) -> str:
     return ""
 
 
+def humanize_stop_intent(stop_intent: str) -> str:
+    return stop_intent.replace("_", " ")
+
+
+def classify_stop_intent(request_text: str, agent_text: str) -> str:
+    """
+    Best-effort rule-based classifier for why the agent is trying to stop.
+
+    We bias away from over-classifying a stop as final completion: a false
+    "checkpoint" is noisy but recoverable; a false "final" triggers the most
+    demanding review path and is the source of most long-session confusion.
+    """
+    text = f"{request_text}\n{agent_text}".lower()
+    agent_only = (agent_text or "").lower()
+
+    decision_patterns = [
+        r"\bneed(s)? your (decision|input|approval|confirmation|preference)\b",
+        r"\bwhich option\b",
+        r"\bchoose (one|between)\b",
+        r"\bdo you want me to\b",
+        r"\bshould i\b",
+        r"\bplease decide\b",
+        r"\byou need to decide\b",
+        r"你(来|需要)?决定",
+        r"你希望我",
+        r"选哪个",
+        r"需要你(拍板|确认|决定|选择)",
+    ]
+    if "?" in agent_text or "？" in agent_text:
+        if any(re.search(pat, text) for pat in decision_patterns):
+            return "needs_user_decision"
+
+    blocked_patterns = [
+        r"\bblocked\b",
+        r"\bwaiting for\b",
+        r"\bcan't continue\b",
+        r"\bcannot continue\b",
+        r"\bunable to proceed\b",
+        r"\bneed(s)? (access|permission|credentials|approval|network|database|token)\b",
+        r"\bmissing dependency\b",
+        r"\bexternal dependency\b",
+        r"\brequires? (access|permission|approval)\b",
+        r"卡住了",
+        r"无法继续",
+        r"缺少(权限|凭据|环境|依赖)",
+        r"等(你|外部)",
+        r"需要(权限|访问|审批|凭据)",
+    ]
+    if any(re.search(pat, text) for pat in blocked_patterns):
+        return "blocked_external"
+
+    checkpoint_patterns = [
+        r"\bcheckpoint\b",
+        r"\bprogress update\b",
+        r"\bin progress\b",
+        r"\bso far\b",
+        r"\bnot finished\b",
+        r"\bpartial(ly)?\b",
+        r"\bremaining\b",
+        r"\bnext steps?\b",
+        r"\bwip\b",
+        r"\bcurrent status\b",
+        r"进度",
+        r"目前(做到|完成)",
+        r"先同步",
+        r"阶段性",
+        r"还没做完",
+        r"下一步",
+        r"剩余",
+    ]
+    if any(re.search(pat, agent_only) for pat in checkpoint_patterns):
+        return "checkpoint_update"
+
+    final_patterns = [
+        r"\bdone\b",
+        r"\bcompleted\b",
+        r"\bfinished\b",
+        r"\ball set\b",
+        r"\bimplemented\b",
+        r"\bfixed\b",
+        r"\bresolved\b",
+        r"\btests? (pass|passed|green)\b",
+        r"\bbuild (passes|passed|succeeds|succeeded)\b",
+        r"\bready\b",
+        r"已完成",
+        r"完成了",
+        r"搞定了",
+        r"已修复",
+        r"修好了",
+        r"测试通过",
+        r"可以交付",
+        r"可以结束",
+    ]
+    if any(re.search(pat, agent_only) for pat in final_patterns):
+        return "final_completion"
+
+    exploratory_patterns = [
+        r"\binitial finding",
+        r"\bpreliminary\b",
+        r"\bhypothesis\b",
+        r"\bneed to investigate further\b",
+        r"\bmore investigation\b",
+        r"初步判断",
+        r"猜测",
+        r"还需要继续排查",
+        r"先记一下",
+    ]
+    if any(re.search(pat, text) for pat in exploratory_patterns):
+        return "exploratory_pause"
+
+    return DEFAULT_STOP_INTENT
+
+
+def trigger_mode_for_scenario(triggered_scenario: str, config: dict) -> str:
+    reviewer_cfg = config.get("reviewer", {}) if isinstance(config.get("reviewer"), dict) else {}
+    raw_default = reviewer_cfg.get("trigger_mode", DEFAULT_TRIGGER_MODE)
+    default_mode = raw_default if raw_default in VALID_TRIGGER_MODES else DEFAULT_TRIGGER_MODE
+
+    by_scenario = reviewer_cfg.get("trigger_mode_by_scenario", {})
+    if triggered_scenario and isinstance(by_scenario, dict):
+        raw_specific = by_scenario.get(triggered_scenario)
+        if raw_specific in VALID_TRIGGER_MODES:
+            return raw_specific
+    return default_mode
+
+
+def should_review_stop_intent(stop_intent: str, trigger_mode: str) -> bool:
+    if trigger_mode == "always":
+        return True
+    if trigger_mode == "claim_done_only":
+        return stop_intent == "final_completion"
+    # intent_sensitive: let true completion and user-facing pause reasons
+    # block, but don't interrupt purely exploratory pauses.
+    return stop_intent in {
+        "final_completion",
+        "checkpoint_update",
+        "needs_user_decision",
+        "blocked_external",
+    }
+
+
 def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
     """
     Five-layer fallback (highest precedence first):
@@ -416,6 +659,16 @@ def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
     return BUNDLED_PROMPT
 
 
+def resolve_intent_prompt_path(stop_intent: str) -> Optional[Path]:
+    user_prompt = USER_INTENTS_DIR / f"{stop_intent}.md"
+    if user_prompt.exists():
+        return user_prompt
+    bundled_prompt = BUNDLED_INTENTS_DIR / f"{stop_intent}.md"
+    if bundled_prompt.exists():
+        return bundled_prompt
+    return None
+
+
 def find_pin_directive(records: list) -> tuple:
     """
     Scan real user records newest-first for the most recent pin/unpin directive.
@@ -430,17 +683,13 @@ def find_pin_directive(records: list) -> tuple:
 
     Last directive wins; subsequent pin replaces earlier pin; unpin clears.
     """
-    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
-    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
     for rec in reversed(records):
         if not is_real_user_record(rec):
             continue
-        content = rec["message"]["content"]
-        m = name_pat.search(content)
-        if not m or m.group(1) != "reflect-and-refine":
+        norm = normalized_message_record(rec)
+        skill, args = extract_command_invocation(norm["content"] if norm else "")
+        if skill != CONTROL_SKILL:
             continue
-        args_m = args_pat.search(content)
-        args = (args_m.group(1).strip() if args_m else "")
         parts = args.split()
         if not parts:
             continue
@@ -478,11 +727,12 @@ def find_pinned_skill(records: list) -> Optional[str]:
 def last_user_timestamp(records: list[dict]) -> str:
     for rec in reversed(records):
         if is_real_user_record(rec):
-            return rec.get("timestamp", "")
+            norm = normalized_message_record(rec)
+            return norm.get("timestamp", "") if norm else ""
     return ""
 
 
-def last_user_command_parts(records: list[dict]) -> tuple[str, str]:
+def last_user_command_parts(records: list[dict], fallback_assistant_text: str = "") -> tuple[str, str]:
     """
     Return (request_text, agent_response_text).
 
@@ -493,9 +743,6 @@ def last_user_command_parts(records: list[dict]) -> tuple[str, str]:
     AFTER the most recent real user message. This captures the full response
     across tool-call boundaries, not just the last text block.
     """
-    name_pat = re.compile(r"<command-name>/([\w-]+)</command-name>")
-    args_pat = re.compile(r"<command-args>([^<]*)</command-args>", re.DOTALL)
-
     # Find index of last real user record
     last_user_idx = -1
     for i in range(len(records) - 1, -1, -1):
@@ -506,43 +753,51 @@ def last_user_command_parts(records: list[dict]) -> tuple[str, str]:
     if last_user_idx == -1:
         return "", ""
 
-    user_rec = records[last_user_idx]
-    content = user_rec["message"]["content"]
-    name_match = name_pat.search(content)
-    args_match = args_pat.search(content)
-    if name_match and args_match:
-        request_text = f"/{name_match.group(1)} {args_match.group(1).strip()}"
-    elif name_match:
-        request_text = f"/{name_match.group(1)}"
+    user_rec = normalized_message_record(records[last_user_idx]) or {}
+    content = user_rec.get("content", "")
+    skill, args = extract_command_invocation(content)
+    if skill and args:
+        request_text = f"/{skill} {args}"
+    elif skill:
+        request_text = f"/{skill}"
     else:
         cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", content, flags=re.DOTALL).strip()
         request_text = cleaned[:4000]
 
     agent_text_blocks: list[str] = []
     for rec in records[last_user_idx + 1 :]:
-        if rec.get("type") != "assistant":
+        norm = normalized_message_record(rec)
+        if not norm or norm.get("role") != "assistant":
             continue
-        msg = rec.get("message", {})
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    t = (block.get("text") or "").strip()
-                    if t:
-                        agent_text_blocks.append(t)
-        elif isinstance(content, str):
-            s = content.strip()
-            if s:
-                agent_text_blocks.append(s)
+        s = norm.get("content", "").strip()
+        if s:
+            agent_text_blocks.append(s)
 
-    agent_text = "\n\n".join(agent_text_blocks)[:8000]
+    agent_text = "\n\n".join(agent_text_blocks).strip()
+    if not agent_text and fallback_assistant_text:
+        agent_text = fallback_assistant_text.strip()
+    agent_text = agent_text[:8000]
     return request_text, agent_text
 
 
-def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bool:
+def sanitize_max_blocks(raw_value) -> tuple[int, bool]:
+    """
+    Return (effective_value, corrected_invalid_input).
+    Invalid values fail safe to the default instead of disabling blocking.
+    """
+    try:
+        value = int(raw_value)
+    except Exception:
+        return DEFAULT_MAX_BLOCKS_PER_TURN, True
+    if value < 1:
+        return DEFAULT_MAX_BLOCKS_PER_TURN, True
+    return value, False
+
+
+def increment_counter(session_id: str, turn_key: str, max_blocks: int) -> bool:
     """
     Per-turn counter. Returns True if we should block, False if rate-limited.
-    State format: "<last_user_ts> <count>\n" in /tmp/rar-<session>.state
+    State format: "<turn_key> <count>\n" in /tmp/rar-<session>.state
     """
     state_file = Path(f"/tmp/rar-{session_id}.state")
     saved_ts, saved_count = "", 0
@@ -554,7 +809,7 @@ def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bo
         except Exception:
             saved_ts, saved_count = "", 0
 
-    if last_user_ts != saved_ts:
+    if turn_key != saved_ts:
         # New user turn -> reset
         count = 0
     else:
@@ -564,7 +819,7 @@ def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bo
         return False
 
     try:
-        state_file.write_text(f"{last_user_ts} {count + 1}\n")
+        state_file.write_text(f"{turn_key} {count + 1}\n")
     except Exception as e:
         log_error(f"failed to write state {state_file}: {e}")
 
@@ -574,10 +829,10 @@ def increment_counter(session_id: str, last_user_ts: str, max_blocks: int) -> bo
 def extract_reviewer_prompt_body(body: str) -> str:
     """
     Prompt template bodies historically have two `---` markers AFTER the
-    YAML frontmatter that wrap the "pass this verbatim to Task" reviewer
-    block. For the file-based reason flow (v0.3.1+), we want JUST that
-    inner reviewer block — the outer "Call the Task tool..." scaffolding
-    is now generated by the hook directly in a short reason.
+    YAML frontmatter that wrap the reviewer block. For the file-based reason
+    flow (v0.3.1+), we want JUST that inner reviewer block — the outer
+    runtime-specific scaffolding is generated by the hook directly in a
+    short reason.
 
     If `---` delimiters are present, return the text between the first
     two (after stripping). Otherwise return the body as-is — a template
@@ -592,44 +847,64 @@ def extract_reviewer_prompt_body(body: str) -> str:
     return body.strip()
 
 
-def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path) -> tuple:
+def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path, stop_intent: str) -> tuple:
     """
     Read the prompt file, parse frontmatter, substitute placeholders, and
     return (reviewer_prompt, model_param, frontmatter_dict). The returned
     reviewer_prompt is JUST the reviewer's instructions — suitable for
-    writing to a session file and passing verbatim to Task.
+    writing to a session file and passing verbatim to a reviewer.
 
     Templates without frontmatter (legacy or user-edited without YAML) still
     work — sane defaults fill in for missing fields.
     """
     full = prompt_path.read_text()
-    fm, body = parse_frontmatter(full)
-    reviewer_body = extract_reviewer_prompt_body(body)
+    scenario_fm, scenario_body = parse_frontmatter(full)
+    reviewer_body = extract_reviewer_prompt_body(scenario_body)
+    intent_prompt_path = None
+    intent_fm = {}
 
-    language = fm.get("language", "en") or "en"
-    strictness = fm.get("strictness", "default") or "default"
+    if stop_intent != "final_completion":
+        intent_prompt_path = resolve_intent_prompt_path(stop_intent)
+        if intent_prompt_path is not None:
+            intent_full = intent_prompt_path.read_text()
+            intent_fm, intent_body = parse_frontmatter(intent_full)
+            reviewer_body = extract_reviewer_prompt_body(intent_body)
+
+    language = scenario_fm.get("language", intent_fm.get("language", "en")) or "en"
+    strictness = scenario_fm.get("strictness", intent_fm.get("strictness", "default")) or "default"
     if strictness not in STRICTNESS_DIRECTIVES:
         strictness = "default"
 
-    model_raw = (fm.get("model") or fm.get("model_preference") or "").strip().lower()
+    model_raw = (
+        scenario_fm.get("model")
+        or scenario_fm.get("model_preference")
+        or intent_fm.get("model")
+        or intent_fm.get("model_preference")
+        or ""
+    ).strip().lower()
     if model_raw in VALID_REVIEWER_MODELS:
         model_preference_param = f"- `model`: `{model_raw}`\n"
     else:
         model_preference_param = ""
 
-    dimensions = fm.get("dimensions", [])
+    dimensions = scenario_fm.get("dimensions", intent_fm.get("dimensions", []))
     if not isinstance(dimensions, list):
         dimensions = []
     if not dimensions:
         dimensions = ["requirement_split", "evidence", "hedging", "silent_drops", "fake_evidence"]
 
-    custom_checks = fm.get("custom_checks", [])
+    custom_checks = scenario_fm.get("custom_checks", intent_fm.get("custom_checks", []))
     if not isinstance(custom_checks, list):
         custom_checks = []
 
     strictness_directive = STRICTNESS_DIRECTIVES.get(strictness, STRICTNESS_DIRECTIVES["default"])
     dimensions_block = assemble_dimensions_block(dimensions, strictness)
     custom_checks_block = assemble_custom_checks_block(custom_checks)
+    scenario_focus = (
+        scenario_fm.get("focus")
+        or intent_fm.get("focus")
+        or "general work completion and evidence quality"
+    )
 
     reviewer = (
         reviewer_body
@@ -640,8 +915,15 @@ def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path)
         .replace("{MODEL_PREFERENCE_PARAM}", model_preference_param)
         .replace("{DIMENSIONS_BLOCK}", dimensions_block)
         .replace("{CUSTOM_CHECKS_BLOCK}", custom_checks_block)
+        .replace("{STOP_INTENT}", stop_intent)
+        .replace("{STOP_INTENT_HUMAN}", humanize_stop_intent(stop_intent))
+        .replace("{SCENARIO_FOCUS}", scenario_focus)
     )
-    return reviewer, model_preference_param, fm
+    meta = dict(scenario_fm)
+    meta["_intent_prompt_path"] = str(intent_prompt_path) if intent_prompt_path else ""
+    meta["_stop_intent"] = stop_intent
+    meta["_scenario_focus"] = scenario_focus
+    return reviewer, model_preference_param, meta
 
 
 def write_session_prompt_file(session_id: str, reviewer_prompt: str) -> Path:
@@ -672,7 +954,9 @@ def sweep_old_session_files() -> None:
 # Short reason emitted to the main agent. References the per-session file
 # where the full reviewer prompt lives. Keeps terminal rendering small
 # (<600 chars per block) while preserving all behaviour.
-SHORT_REASON_TEMPLATE = """[REFLECT-AND-REFINE] Completion review required before stop.
+CLAUDE_SHORT_REASON_TEMPLATE = """[REFLECT-AND-REFINE] Completion review required before stop.
+
+This stop attempt was classified as: `{STOP_INTENT}`.
 
 Call the Task tool:
 - `subagent_type`: `general-purpose`
@@ -681,18 +965,46 @@ Call the Task tool:
 
 Act on the verdict:
 - `approved` → output exactly `REVIEWER APPROVED. Stopping.` and stop
-- `incomplete` or `fake_evidence` → list the `missing_items`, continue working on them, do NOT stop
-
-The prompt file contains the full reviewer instructions (role, dimensions, substituted user request + agent response, verdict schema). It's regenerated on every block and self-cleans after 7 days.
+- `continue_work`, legacy `incomplete`, or `fake_evidence` → list `missing_items`, continue, do NOT stop
+- `checkpoint_ok` → send a checkpoint (done / remaining / next), then stop
+- `waiting_for_user` → ask the blocking decision clearly, then stop
+- `waiting_for_external_dependency` → explain blocker + exact unblock needed, then stop
 """
 
 
-def build_block_reason(request_text: str, agent_text: str, prompt_path: Path, session_id: str) -> tuple:
+CODEX_SHORT_REASON_TEMPLATE = """[REFLECT-AND-REFINE] Completion review required before stop.
+
+This stop attempt was classified as: `{STOP_INTENT}`.
+
+Before stopping, run an adversarial completion review using the prompt file {PROMPT_FILE}.
+- If this runtime exposes an agent/subagent tool, use it for the review.
+- Otherwise perform the review in-turn under the label `Adversarial Review (in-turn)`.
+- Read the file and follow the reviewer instructions exactly. Derive the JSON verdict it specifies before deciding whether you may stop.
+
+Act on the verdict:
+- `approved` -> output exactly `REVIEWER APPROVED. Stopping.` and stop
+- `continue_work`, legacy `incomplete`, or `fake_evidence` -> list `missing_items`, continue, do NOT stop
+- `checkpoint_ok` -> send a checkpoint (done / remaining / next), then stop
+- `waiting_for_user` -> ask the blocking decision clearly, then stop
+- `waiting_for_external_dependency` -> explain blocker + exact unblock needed, then stop
+"""
+
+
+def detect_runtime(payload: dict, records: list[dict]) -> str:
+    """Best-effort runtime detection for dual Claude Code / Codex support."""
+    if payload.get("turn_id") or payload.get("last_assistant_message") or payload.get("hook_event_name"):
+        return "codex"
+    if any(rec.get("type") == "response_item" for rec in records):
+        return "codex"
+    return "claude"
+
+
+def build_block_reason(request_text: str, agent_text: str, prompt_path: Path, session_id: str, runtime: str, stop_intent: str) -> tuple:
     """
     Build the short reason emitted to the main agent, plus write the full
     reviewer prompt to the per-session file. Returns (short_reason, session_file_path).
     """
-    reviewer_prompt, model_param, _fm = build_reviewer_prompt(request_text, agent_text, prompt_path)
+    reviewer_prompt, model_param, _fm = build_reviewer_prompt(request_text, agent_text, prompt_path, stop_intent)
     session_file = write_session_prompt_file(session_id, reviewer_prompt)
     sweep_old_session_files()
 
@@ -702,11 +1014,10 @@ def build_block_reason(request_text: str, agent_text: str, prompt_path: Path, se
     except Exception:
         rendered_path = str(session_file)
 
-    short = (
-        SHORT_REASON_TEMPLATE
-        .replace("{MODEL_PREFERENCE_PARAM}", model_param)
-        .replace("{PROMPT_FILE}", rendered_path)
-    )
+    template = CLAUDE_SHORT_REASON_TEMPLATE if runtime == "claude" else CODEX_SHORT_REASON_TEMPLATE
+    short = template.replace("{PROMPT_FILE}", rendered_path).replace("{STOP_INTENT}", stop_intent)
+    if runtime == "claude":
+        short = short.replace("{MODEL_PREFERENCE_PARAM}", model_param)
     return short, session_file
 
 
@@ -715,9 +1026,9 @@ def main() -> None:
     # possible):
     # 1. RAR_DISABLED env var non-empty  -> silent exit.
     # 2. ~/.reflect-and-refine/.paused file exists -> silent exit.
-    # Both exist so users can disable the hook from outside Claude Code
+    # Both exist so users can disable the hook from outside the agent client
     # (e.g. from an old session that predates skill install, where the
-    # /reflect-and-refine shutdown slash command isn't registered).
+    # /reflect-and-refine shutdown marker isn't available yet).
     if os.environ.get("RAR_DISABLED"):
         return
     if PAUSE_FLAG.exists():
@@ -744,8 +1055,6 @@ def main() -> None:
         return
 
     registered = set(config.get("registered_skills", []))
-    if not registered:
-        return  # nothing registered -> never fire
 
     try:
         records = read_transcript(Path(transcript_path))
@@ -783,34 +1092,60 @@ def main() -> None:
         if triggered_scenario != pin_target:
             return
 
-    max_blocks = int(config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN))
-    last_ts = last_user_timestamp(records)
-    state_file = Path(f"/tmp/rar-{session_id or 'unknown'}.state")
-    prior_count = 0
     try:
-        if state_file.exists():
-            parts = state_file.read_text().strip().split(maxsplit=1)
-            if len(parts) == 2 and parts[0] == last_ts:
-                prior_count = int(parts[1])
-    except Exception:
-        prior_count = 0
-
-    should_block = increment_counter(session_id or "unknown", last_ts, max_blocks)
-    if not should_block:
-        audit_log(
-            "RATE-LIMITED",
-            session_id,
-            {
-                "reason": f"per-turn cap reached ({prior_count}/{max_blocks}); stop allowed",
-                "turn_user_ts": last_ts,
-            },
+        runtime = detect_runtime(payload, records)
+        request_text, agent_text = last_user_command_parts(
+            records, fallback_assistant_text=payload.get("last_assistant_message", "") or ""
         )
-        return
+        stop_intent = classify_stop_intent(request_text, agent_text)
+        triggered_scenario = scenario_for_skill(triggered_skill, config) or "general"
+        trigger_mode = trigger_mode_for_scenario(triggered_scenario, config)
+        if not should_review_stop_intent(stop_intent, trigger_mode):
+            return
 
-    try:
-        request_text, agent_text = last_user_command_parts(records)
+        max_blocks, corrected_invalid_max = sanitize_max_blocks(
+            config.get("max_blocks_per_turn", DEFAULT_MAX_BLOCKS_PER_TURN)
+        )
+        if corrected_invalid_max:
+            log_error(
+                f"invalid max_blocks_per_turn={config.get('max_blocks_per_turn')!r}; "
+                f"using default {DEFAULT_MAX_BLOCKS_PER_TURN}"
+            )
+
+        turn_key = payload.get("turn_id") or last_user_timestamp(records) or (session_id or "unknown")
+        state_file = Path(f"/tmp/rar-{session_id or 'unknown'}.state")
+        prior_count = 0
+        try:
+            if state_file.exists():
+                parts = state_file.read_text().strip().split(maxsplit=1)
+                if len(parts) == 2 and parts[0] == turn_key:
+                    prior_count = int(parts[1])
+        except Exception:
+            prior_count = 0
+
+        should_block = increment_counter(session_id or "unknown", turn_key, max_blocks)
+        if not should_block:
+            audit_log(
+                "RATE-LIMITED",
+                session_id,
+                {
+                    "reason": f"per-turn cap reached ({prior_count}/{max_blocks}); stop allowed",
+                    "turn_key": turn_key,
+                    "stop_intent": stop_intent,
+                    "trigger_mode": trigger_mode,
+                },
+            )
+            return
+
         prompt_path = resolve_prompt_path(triggered_skill, config)
-        reason, session_file = build_block_reason(request_text, agent_text, prompt_path, session_id or "unknown")
+        reason, session_file = build_block_reason(
+            request_text,
+            agent_text,
+            prompt_path,
+            session_id or "unknown",
+            runtime,
+            stop_intent,
+        )
     except Exception as e:
         log_error(f"build reason failed: {e}")
         return
@@ -833,7 +1168,10 @@ def main() -> None:
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
                 "gate_trigger": f"/{triggered_skill} in transcript",
-                "triggered_scenario": scenario_for_skill(triggered_skill, config) or "(unmapped)",
+                "triggered_scenario": triggered_scenario or "(unmapped)",
+                "stop_intent": stop_intent,
+                "trigger_mode": trigger_mode,
+                "runtime": runtime,
                 "pinned_to": pin_description,
                 "prompt_source": str(prompt_path).replace(str(HOME), "~"),
                 "session_file": str(session_file).replace(str(HOME), "~"),

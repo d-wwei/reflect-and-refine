@@ -10,6 +10,7 @@
 language: en
 strictness: default
 model: default
+focus: root-cause analysis, reproduction quality, and fix verification
 
 # For debugging, consistency matters most (does the proposed fix
 # actually match the stated cause?) and silent_drops catches the
@@ -60,9 +61,9 @@ Check these dimensions:
 {CUSTOM_CHECKS_BLOCK}
 
 Return ONLY this JSON (no prose before or after, no code fencing):
-{"verdict":"approved"|"incomplete"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
+{"verdict":"approved"|"continue_work"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
 
 Verdicts:
 - approved — root cause named, reproduction verified, fix verified against reproduction, regression test added, sibling instances considered
-- incomplete — ≥1 of the above missing (e.g., fix works but no regression test)
+- continue_work — ≥1 of the above missing (e.g., fix works but no regression test)
 - fake_evidence — claimed reproduction or verification steps appear fabricated / inconsistent with the diff

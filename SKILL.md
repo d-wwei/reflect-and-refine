@@ -2,19 +2,20 @@
 name: reflect-and-refine
 description: |
   Adversarial completion review at agent Stop time. When an active skill's gate is open,
-  every time the main agent tries to stop, a mandatory reviewer sub-agent is spawned to
+  every time the main agent tries to stop, a mandatory adversarial review step runs to
   audit whether the user's original request is actually complete with concrete evidence.
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
-  protocols. Works standalone; integrates loosely with any parent skill via registration.
+  protocols. Works in Claude Code and Codex; integrates loosely with any parent skill via registration.
   Subcommands: configure, status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin, map.
 ---
 
 # Reflect and Refine
 
-Mechanical completion review: a Stop hook that forces the main agent to spawn an independent
-reviewer sub-agent before it can claim "done". The reviewer has no skin in the game, sees only
-the user's request and the agent's response, and must return a structured verdict.
+Mechanical completion review: a Stop hook that forces the main agent through an independent
+review step before it can claim "done". In Claude Code this is a reviewer sub-agent; in Codex it
+uses a runtime-native reviewer when available, otherwise an explicit in-turn adversarial review.
+The reviewer sees only the user's request and the agent's response, and must return a structured verdict.
 
 ## How the gate works
 
@@ -38,6 +39,15 @@ Query/config subcommands of reflect-and-refine itself are intentionally transpar
 
 There is no time-window expiry by default — activation persists until you explicitly shut it down or start a new session.
 
+Once the gate is open, the hook classifies the stop into one of:
+- `final_completion`
+- `checkpoint_update`
+- `needs_user_decision`
+- `blocked_external`
+- `exploratory_pause`
+
+That stop intent is then combined with the current scenario. In practice this means a coding/testing checkpoint is no longer reviewed with the exact same questions as a claimed final completion.
+
 ## Subcommands
 
 ### `/reflect-and-refine configure`
@@ -50,7 +60,9 @@ There is no time-window expiry by default — activation persists until you expl
    ```bash
    jq . ~/.reflect-and-refine/config.json
    ls -la ~/.reflect-and-refine/.paused 2>&1  # existence of pause flag
-   ls ~/.claude/skills/                       # all installed skills
+   ls ~/.claude/skills/ 2>/dev/null || true
+   ls ~/.codex/skills/ 2>/dev/null || true
+   ls ~/.agents/skills/ 2>/dev/null || true
    ls ~/.better-work-series/reflect-and-refine/prompts/scenarios/  # available scenarios (bundled)
    ls ~/.reflect-and-refine/prompts/scenarios/ 2>&1  # available scenarios (user)
    ```
@@ -64,7 +76,7 @@ There is no time-window expiry by default — activation persists until you expl
      ✓ better-code    → coding
      ✓ better-test    → testing
      ✓ better-work    → general
-   Other skills at ~/.claude/skills/ not registered (N):
+   Other detected skills not registered (union of ~/.claude/skills, ~/.codex/skills, ~/.agents/skills) (N):
      ○ great-writer
      ○ cognitive-kernel
      ○ labloop
@@ -76,8 +88,8 @@ There is no time-window expiry by default — activation persists until you expl
 
    | # | Option | Effect |
    |---|--------|--------|
-   | 1 | **Toggle individual skills** | Checklist UI: for each skill in `~/.claude/skills/`, show ✓ or ○; user flips as many as wanted; confirm before writing |
-   | 2 | **Enable all detected skills** | Add every skill under `~/.claude/skills/` to `registered_skills`; default-map unmapped ones to `general` |
+   | 1 | **Toggle individual skills** | Checklist UI: for each detected skill (union of `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/`), show ✓ or ○; user flips as many as wanted; confirm before writing |
+   | 2 | **Enable all detected skills** | Add every detected skill to `registered_skills`; default-map unmapped ones to `general` |
    | 3 | **Disable all** | Clear `registered_skills` to `[]`; gate will be CLOSED everywhere until you re-register something |
    | 4 | **Change scenario mapping** | For each registered skill show current scenario; ask which to change; offer `coding / testing / debugging / general / <new>` |
    | 5 | **Pause the hook globally** | `touch ~/.reflect-and-refine/.paused`; all sessions silent until unpause |
@@ -94,7 +106,7 @@ There is no time-window expiry by default — activation persists until you expl
 **Sub-dialog details**:
 
 **Option 1 — Toggle individual**:
-- Show each skill in `~/.claude/skills/` as `[✓|○] <name>  (scenario: <mapped-or-unmapped>)`.
+- Show each detected skill as `[✓|○] <name>  (scenario: <mapped-or-unmapped>)`. Build the list from the union of `~/.claude/skills/`, `~/.codex/skills/`, and `~/.agents/skills/`.
 - Let user type a list of skill names to flip (or numbers if listed with indices).
 - For each skill being ENABLED that has no scenario mapping, ask "which scenario?" (default: general).
 - Write via jq merge.
@@ -181,7 +193,7 @@ When invoked, read `~/.reflect-and-refine/config.json` and report:
 - Current turn's block count (from `/tmp/rar-<session-id>.state` if present)
 - Last OPEN/CLOSED marker detected in this session's transcript
 - Whether `~/.reflect-and-refine/.paused` exists (kill switch #1 active)
-- Whether `RAR_DISABLED` env var is set on the Claude Code process (kill switch #2 active — inspect via the transcript's env info if available, else state it's unverifiable from the agent)
+- Whether `RAR_DISABLED` env var is set on the current agent process (kill switch #2 active — inspect via the runtime's available env/process context if possible, else state it's unverifiable from inside the agent)
 
 ### `/reflect-and-refine register <skill-name> [<skill-name> ...]`
 Append one or more skill names to the registered list in `~/.reflect-and-refine/config.json`.
@@ -228,7 +240,7 @@ Fully interactive, guided wizard to create or edit a reviewer prompt. **Every en
    - `lenient` — flag only serious gaps
    - `default` — standard completion review
    - `strict` — assume the agent is cutting corners
-4. **Model preference** — "Which Claude tier for the reviewer subagent?":
+4. **Model preference** — "Which reviewer model tier do you prefer when the runtime supports choosing one?":
    - `haiku` — fast + cheap (routine checks)
    - `sonnet` — balanced (most projects)
    - `opus` — deepest analysis (high-stakes reviews)
@@ -282,6 +294,13 @@ Stored in `~/.reflect-and-refine/config.json`:
   "max_blocks_per_turn": 3,
   "suppress_output": true,
   "reviewer": {
+    "trigger_mode": "intent_sensitive",
+    "trigger_mode_by_scenario": {
+      "coding": "claim_done_only",
+      "testing": "claim_done_only",
+      "debugging": "intent_sensitive",
+      "general": "intent_sensitive"
+    },
     "skill_scenario_map": {
       "better-code": "coding",
       "better-test": "testing",
@@ -296,39 +315,46 @@ Stored in `~/.reflect-and-refine/config.json`:
 
 **`reviewer.per_skill`** (escape hatch): skill name → absolute or relative path to a specific prompt file. Takes precedence over scenario lookup. Use when one skill needs treatment completely different from its domain scenario.
 
-**`suppress_output`** (default `true`): see "Customising the reviewer → terminal noise" in README.
+**`reviewer.trigger_mode`** / **`reviewer.trigger_mode_by_scenario`**: controls how aggressively Stop events are reviewed.
+- `always` → every eligible Stop is reviewed
+- `claim_done_only` → only stops classified as `final_completion`
+- `intent_sensitive` → final completion plus user-facing pauses (`checkpoint_update`, `needs_user_decision`, `blocked_external`); exploratory pauses are skipped
 
-**`suppress_output`** (default `true`): when true, the injected reviewer prompt dump does NOT render in the terminal — Claude Code shows only a brief "Ran 1 stop hook" summary line (collapsed; press ctrl+o to expand). The main agent still receives the full instructions in its context. Set to `false` if you want to see the full prompt in the terminal for debugging. First-time session banner is also suppressed in quiet mode.
+**`suppress_output`** (default `true`): when true, the injected reviewer prompt dump does NOT render in the terminal. Claude Code currently collapses this well; Codex parses the field too, but terminal suppression may vary by runtime version. Set to `false` if you want maximal hook visibility while debugging.
 
 ## Emergency shutdown (without a slash command)
 
-If you're in a Claude Code session that was started BEFORE `reflect-and-refine` was installed, the `/reflect-and-refine` slash command isn't registered and `/reflect-and-refine shutdown` won't work. Two escape hatches work from any shell:
+If you're in a session that was started BEFORE `reflect-and-refine` was installed, the command marker may not be available yet and `/reflect-and-refine shutdown` won't work. Two escape hatches work from any shell:
 
 1. **Pause flag file** — the hook checks for `~/.reflect-and-refine/.paused` before doing any work. If present, it exits silently:
    ```bash
    touch ~/.reflect-and-refine/.paused     # pause
    rm    ~/.reflect-and-refine/.paused     # resume
    ```
-2. **Env var on Claude Code's process** — set `RAR_DISABLED=1` before launching `claude`:
+2. **Env var on the agent process** — set `RAR_DISABLED=1` before launching the client:
    ```bash
    RAR_DISABLED=1 claude
+   RAR_DISABLED=1 codex
    ```
 
 Both are checked at the very top of the hook script, so the override is essentially free (no transcript read, no config parse).
 
 ## Install / uninstall
 
-See `install.sh` and `uninstall.sh` in the skill root. The installer writes the Stop hook entry
-into your Claude Code user settings (auto-detects `ft-settings.json` vs `settings.json`),
-backing up first, and merges via `jq` so other hooks are preserved.
+See `install.sh` and `uninstall.sh` in the skill root. The installer:
 
-**Hooks are loaded at Claude Code session start.** After install/uninstall you must exit and
-restart Claude Code for the change to take effect.
+- writes the Claude Code Stop hook into user settings (auto-detects `ft-settings.json` vs `settings.json`)
+- writes the Codex Stop hook into `~/.codex/hooks.json`
+- installs skill symlinks for Claude Code and Codex skill locations
+- preserves unrelated hooks via `jq` merge
+- only enables Codex's experimental `codex_hooks` feature flag when explicitly asked (`./install.sh --enable-codex-feature-flag`)
+
+**Hooks are loaded at client session start.** After install/uninstall you must restart Claude Code and Codex for the change to take effect.
 
 ## Limitations
 
 - Requires Python 3 (macOS default includes it; Linux usually has it).
 - `jq` required for install/uninstall (installer checks and errors clearly if missing).
-- The reviewer sub-agent costs tokens per Stop event while the gate is open. Budget accordingly.
+- The reviewer step costs tokens per Stop event while the gate is open. Budget accordingly.
 - The main agent can still try to manipulate what it feeds the reviewer. The hook pre-extracts
   transcript excerpts to reduce this risk, but strong adversarial behavior needs prompt iteration.

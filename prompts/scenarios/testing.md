@@ -12,6 +12,7 @@ language: en
 # through the safety net that's supposed to catch them.
 strictness: strict
 model: default
+focus: test evidence quality, edge-case coverage, and whether the safety net is real
 
 # completeness is critical in testing — implicit edge cases (empty,
 # large, unicode, concurrency, malformed) are the point of the job.
@@ -58,9 +59,9 @@ Check these dimensions:
 {CUSTOM_CHECKS_BLOCK}
 
 Return ONLY this JSON (no prose before or after, no code fencing):
-{"verdict":"approved"|"incomplete"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
+{"verdict":"approved"|"continue_work"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
 
 Verdicts:
 - approved — every requirement has concrete evidence, raw test output included, edge cases addressed or explicitly skipped with reason
-- incomplete — ≥1 requirement lacks evidence or edge case was silently dropped
+- continue_work — ≥1 requirement lacks evidence or edge case was silently dropped
 - fake_evidence — ≥1 claim of test output, coverage, or assertion appears fabricated or is missing the raw output

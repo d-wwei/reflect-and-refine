@@ -8,6 +8,7 @@
 language: en
 strictness: default
 model: default
+focus: general work completion and evidence quality
 
 dimensions:
   - requirement_split
@@ -35,9 +36,9 @@ Check these dimensions:
 {CUSTOM_CHECKS_BLOCK}
 
 Return ONLY this JSON (no prose before or after, no code fencing):
-{"verdict":"approved"|"incomplete"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
+{"verdict":"approved"|"continue_work"|"fake_evidence","missing_items":["requirement: what's missing"],"reason":"one-paragraph explanation"}
 
 Verdicts:
 - approved — every requirement has concrete, non-hedged evidence
-- incomplete — ≥1 requirement lacks evidence or was skipped
+- continue_work — ≥1 requirement lacks evidence or was skipped
 - fake_evidence — ≥1 claim of evidence appears fabricated

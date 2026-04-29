@@ -57,7 +57,7 @@ def _mk_plain_user(text: str, ts="2026-04-23T01:00:00Z"):
     return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
 
 
-REGISTERED = {"reflect-and-refine", "better-work", "better-code", "better-test"}
+REGISTERED = {"rnr", "reflect-and-refine", "better-work", "better-code", "better-test"}
 
 
 class FrontmatterParser(unittest.TestCase):
@@ -136,6 +136,18 @@ class GateStateSemantics(unittest.TestCase):
     def test_rar_activate_opens(self):
         self.assertEqual(
             sg.gate_state([_mk_user_rec("reflect-and-refine", "activate")], REGISTERED),
+            ("OPEN", "reflect-and-refine"),
+        )
+
+    def test_rnr_activate_alias_opens(self):
+        self.assertEqual(
+            sg.gate_state([_mk_user_rec("rnr", "activate")], REGISTERED),
+            ("OPEN", "reflect-and-refine"),
+        )
+
+    def test_rnr_scenario_activation_opens(self):
+        self.assertEqual(
+            sg.gate_state([_mk_user_rec("rnr", "coding")], REGISTERED, {"coding", "testing"}),
             ("OPEN", "reflect-and-refine"),
         )
 
@@ -218,6 +230,10 @@ class GateStateSemantics(unittest.TestCase):
         seq = [_mk_user_rec("reflect-and-refine", "activate")]
         self.assertEqual(sg.gate_state(seq, set()), ("OPEN", "reflect-and-refine"))
 
+    def test_rnr_scenario_works_with_empty_registry(self):
+        seq = [_mk_user_rec("rnr", "coding")]
+        self.assertEqual(sg.gate_state(seq, set(), {"coding"}), ("OPEN", "reflect-and-refine"))
+
     def test_no_markers_closed(self):
         seq = [_mk_plain_user("hello there")]
         self.assertEqual(sg.gate_state(seq, REGISTERED), ("CLOSED", ""))
@@ -286,6 +302,30 @@ class PinDirective(unittest.TestCase):
         )
         fake["isMeta"] = True
         self.assertEqual(sg.find_pin_directive([fake]), ("", ""))
+
+
+class ScenarioOverrideSemantics(unittest.TestCase):
+    def test_rnr_scenario_sets_override(self):
+        recs = [_mk_user_rec("rnr", "coding")]
+        self.assertEqual(sg.find_session_scenario_override(recs, {"coding", "testing"}), "coding")
+
+    def test_activate_clears_override(self):
+        recs = [
+            _mk_user_rec("rnr", "coding"),
+            _mk_user_rec("rnr", "activate"),
+        ]
+        self.assertEqual(sg.find_session_scenario_override(recs, {"coding", "testing"}), "")
+
+    def test_activate_scenario_sets_override(self):
+        recs = [_mk_user_rec("rnr", "activate testing")]
+        self.assertEqual(sg.find_session_scenario_override(recs, {"coding", "testing"}), "testing")
+
+    def test_shutdown_clears_override(self):
+        recs = [
+            _mk_user_rec("rnr", "coding"),
+            _mk_user_rec("rnr", "shutdown"),
+        ]
+        self.assertEqual(sg.find_session_scenario_override(recs, {"coding", "testing"}), "")
 
 
 class ScenarioLookup(unittest.TestCase):
@@ -404,7 +444,7 @@ class TranscriptNormalization(unittest.TestCase):
             }
         ]
         req, resp = sg.last_user_command_parts(records, fallback_assistant_text="final reply")
-        self.assertEqual(req, "/reflect-and-refine activate")
+        self.assertEqual(req, "/rnr activate")
         self.assertEqual(resp, "final reply")
 
     def test_extract_plain_slash_command(self):
@@ -412,6 +452,27 @@ class TranscriptNormalization(unittest.TestCase):
             sg.extract_command_invocation("/reflect-and-refine activate"),
             ("reflect-and-refine", "activate"),
         )
+
+    def test_extract_rnr_alias_canonicalized(self):
+        self.assertEqual(
+            sg.extract_command_invocation("/rnr coding"),
+            ("reflect-and-refine", "coding"),
+        )
+
+
+class RuntimeDetection(unittest.TestCase):
+    def test_codex_payload_detected_from_turn_id(self):
+        self.assertEqual(sg.detect_runtime({"turn_id": "turn-1"}, []), "codex")
+
+    def test_codex_payload_detected_from_last_assistant_message(self):
+        self.assertEqual(sg.detect_runtime({"last_assistant_message": "done"}, []), "codex")
+
+    def test_codex_detected_from_response_item_records(self):
+        records = [{"type": "response_item", "payload": {"type": "message", "role": "user", "content": []}}]
+        self.assertEqual(sg.detect_runtime({}, records), "codex")
+
+    def test_claude_not_misclassified_by_hook_event_name_alone(self):
+        self.assertEqual(sg.detect_runtime({"hook_event_name": "Stop"}, []), "claude")
 
 
 class MaxBlocksValidation(unittest.TestCase):
@@ -482,6 +543,7 @@ class PromptResolution(unittest.TestCase):
             "USER_PROMPTS_DIR": sg.USER_PROMPTS_DIR,
             "USER_OVERRIDES_DIR": sg.USER_OVERRIDES_DIR,
             "USER_SCENARIOS_DIR": sg.USER_SCENARIOS_DIR,
+            "USER_INTENTS_DIR": sg.USER_INTENTS_DIR,
             "USER_DEFAULT_PROMPT": sg.USER_DEFAULT_PROMPT,
         }
         self.tmp = Path(tempfile.mkdtemp())
@@ -489,9 +551,11 @@ class PromptResolution(unittest.TestCase):
         sg.USER_PROMPTS_DIR = self.tmp / "prompts"
         sg.USER_OVERRIDES_DIR = self.tmp / "prompts" / "overrides"
         sg.USER_SCENARIOS_DIR = self.tmp / "prompts" / "scenarios"
+        sg.USER_INTENTS_DIR = self.tmp / "prompts" / "intents"
         sg.USER_DEFAULT_PROMPT = self.tmp / "prompts" / "default.md"
         sg.USER_OVERRIDES_DIR.mkdir(parents=True, exist_ok=True)
         sg.USER_SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+        sg.USER_INTENTS_DIR.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
         import shutil
@@ -578,6 +642,14 @@ class PromptResolution(unittest.TestCase):
         p = sg.resolve_prompt_path("better-code", config)
         self.assertEqual(p, override)  # override beats scenario
 
+    def test_scenario_specific_intent_prompt_wins(self):
+        scenario_specific = sg.USER_INTENTS_DIR / "checkpoint_update-coding.md"
+        scenario_specific.write_text("scenario specific")
+        generic = sg.USER_INTENTS_DIR / "checkpoint_update.md"
+        generic.write_text("generic")
+        p = sg.resolve_intent_prompt_path("checkpoint_update", "coding")
+        self.assertEqual(p, scenario_specific)
+
 
 class BuildReviewerPrompt(unittest.TestCase):
     """build_reviewer_prompt reads a prompt file, substitutes placeholders, returns reviewer-only content."""
@@ -632,10 +704,35 @@ agent: {AGENT_RESPONSE}"""
     def test_checkpoint_uses_intent_template(self):
         p = self._write_template("language: en\nstrictness: default\ndimensions: []\ncustom_checks: []\nfocus: code changes")
         try:
-            prompt, _mp, meta = sg.build_reviewer_prompt("req", "progress update: not finished", p, "checkpoint_update")
+            prompt, _mp, meta = sg.build_reviewer_prompt(
+                "req",
+                "progress update: not finished",
+                p,
+                "checkpoint_update",
+                triggered_skill="better-code",
+                triggered_scenario="coding",
+            )
             self.assertIn("checkpoint_ok", prompt)
-            self.assertIn("code changes", prompt)
+            self.assertIn("coding-session checkpoint", prompt)
             self.assertEqual(meta["_stop_intent"], "checkpoint_update")
+        finally:
+            p.unlink()
+
+    def test_skill_protocol_block_injected_for_control_skill(self):
+        p = self._write_template("language: en\nstrictness: default\ndimensions: []\ncustom_checks: []")
+        try:
+            prompt, _mp, meta = sg.build_reviewer_prompt(
+                "req",
+                "done",
+                p,
+                "final_completion",
+                triggered_skill="reflect-and-refine",
+                triggered_scenario="coding",
+            )
+            self.assertIn("First priority before any completion judgment", prompt)
+            self.assertIn("`/rnr`", prompt)
+            self.assertIn("Protocol source:", prompt)
+            self.assertEqual(meta["_triggered_scenario"], "coding")
         finally:
             p.unlink()
 
@@ -768,9 +865,46 @@ class InstallerScripts(unittest.TestCase):
             )
             config_text = (home / ".codex" / "config.toml").read_text()
             self.assertIn("codex_hooks = true", config_text)
+            self.assertTrue((home / ".claude" / "skills" / "reflect-and-refine").is_symlink())
+            self.assertTrue((home / ".claude" / "skills" / "rnr").is_symlink())
+            self.assertTrue((home / ".codex" / "skills" / "reflect-and-refine").is_symlink())
+            self.assertTrue((home / ".codex" / "skills" / "rnr").is_symlink())
+            self.assertTrue((home / ".agents" / "skills" / "reflect-and-refine").is_symlink())
+            self.assertTrue((home / ".agents" / "skills" / "rnr").is_symlink())
 
             installed_cfg = json.loads((home / ".reflect-and-refine" / "config.json").read_text())
-            self.assertEqual(installed_cfg["reviewer"]["trigger_mode_by_scenario"]["coding"], "claim_done_only")
+            self.assertEqual(installed_cfg["reviewer"]["trigger_mode_by_scenario"]["coding"], "intent_sensitive")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_uninstall_removes_rnr_alias_symlinks(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            home = tmp / "home"
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["CODEX_HOME"] = str(home / ".codex")
+            subprocess.run(
+                ["bash", str(REPO / "install.sh"), "--enable-codex-feature-flag"],
+                cwd=REPO,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            subprocess.run(
+                ["bash", str(REPO / "uninstall.sh")],
+                cwd=REPO,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertFalse((home / ".claude" / "skills" / "rnr").exists())
+            self.assertFalse((home / ".codex" / "skills" / "rnr").exists())
+            self.assertFalse((home / ".agents" / "skills" / "rnr").exists())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -854,11 +988,11 @@ class StopHookMainFlow(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_claim_done_only_skips_checkpoint_stop(self):
+    def test_coding_checkpoint_blocks_and_pushes_continue_work(self):
         tmp = Path(tempfile.mkdtemp())
         try:
             home = tmp / "home"
-            session_id = f"claim-done-only-{tmp.name}"
+            session_id = f"coding-checkpoint-{tmp.name}"
             state_file = Path(f"/tmp/rar-{session_id}.state")
             if state_file.exists():
                 state_file.unlink()
@@ -885,7 +1019,7 @@ class StopHookMainFlow(unittest.TestCase):
                             "skill_scenario_map": {"better-code": "coding"},
                             "per_skill": {},
                             "trigger_mode": "intent_sensitive",
-                            "trigger_mode_by_scenario": {"coding": "claim_done_only"},
+                            "trigger_mode_by_scenario": {"coding": "intent_sensitive"},
                         },
                     }
                 )
@@ -906,7 +1040,9 @@ class StopHookMainFlow(unittest.TestCase):
                 check=True,
             )
 
-            self.assertEqual(result.stdout.strip(), "")
+            out = json.loads(result.stdout)
+            self.assertEqual(out["decision"], "block")
+            self.assertIn("checkpoint_update", out["reason"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -920,10 +1056,12 @@ def main():
         RealUserFilter,
         GateStateSemantics,
         PinDirective,
+        ScenarioOverrideSemantics,
         ScenarioLookup,
         StopIntentClassification,
         TriggerModeSemantics,
         TranscriptNormalization,
+        RuntimeDetection,
         MaxBlocksValidation,
         DimensionAssembly,
         CustomChecksAssembly,

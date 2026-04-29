@@ -11,6 +11,7 @@ model: default
 focus: general work completion and evidence quality
 
 dimensions:
+  - skill_compliance
   - requirement_split
   - evidence
   - hedging

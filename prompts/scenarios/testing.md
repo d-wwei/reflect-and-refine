@@ -17,6 +17,7 @@ focus: test evidence quality, edge-case coverage, and whether the safety net is 
 # completeness is critical in testing — implicit edge cases (empty,
 # large, unicode, concurrency, malformed) are the point of the job.
 dimensions:
+  - skill_compliance
   - requirement_split
   - evidence
   - completeness

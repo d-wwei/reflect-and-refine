@@ -16,6 +16,7 @@ focus: root-cause analysis, reproduction quality, and fix verification
 # actually match the stated cause?) and silent_drops catches the
 # "other call sites with the same pattern" miss.
 dimensions:
+  - skill_compliance
   - requirement_split
   - evidence
   - consistency

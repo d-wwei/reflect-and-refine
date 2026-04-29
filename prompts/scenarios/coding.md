@@ -19,6 +19,7 @@ focus: code changes, verification quality, and resistance to fake test/build evi
 # consistency covers contradiction between claims and code; hedging
 # flags "should work" narratives.
 dimensions:
+  - skill_compliance
   - requirement_split
   - evidence
   - fake_evidence

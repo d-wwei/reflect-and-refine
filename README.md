@@ -20,10 +20,10 @@ Written protocols (CLAUDE.md, skill guidance) help but are often bypassed in the
 A per-session **gate** decides whether the review fires on a given Stop event.
 
 - **OPEN** when the most recent slash-command invocation in the transcript is a *registered* skill.
-- **CLOSED** when the last marker is `/reflect-and-refine shutdown` or there are no registered invocations.
+- **CLOSED** when the last marker is `/rnr shutdown` or there are no registered invocations.
 - **Rate-limited** to 3 blocks per user turn so you never get stuck in an infinite loop.
 
-The default registry contains only `reflect-and-refine` itself. Parent skills (like `better-work`) add themselves via `install.sh --register`.
+The default registry contains `rnr` plus the legacy `reflect-and-refine` alias. Parent skills (like `better-work`) add themselves via `install.sh --register`.
 
 No time window by default — once activated, the gate stays open until you `shutdown` or start a new session.
 
@@ -35,14 +35,14 @@ Once the gate is open, the hook also classifies the **stop intent** before choos
 - `blocked_external`
 - `exploratory_pause`
 
-Built-in trigger defaults are quieter for long coding/testing sessions:
+Built-in trigger defaults are stricter about keeping coding/testing sessions moving:
 
-- `coding` → `claim_done_only`
-- `testing` → `claim_done_only`
+- `coding` → `intent_sensitive`
+- `testing` → `intent_sensitive`
 - `debugging` → `intent_sensitive`
 - `general` → `intent_sensitive`
 
-So a mid-stream checkpoint in a coding/testing flow is no longer treated the same way as a claimed final completion.
+So a mid-stream checkpoint in a coding/testing flow is reviewed differently from a claimed final completion, but it is no longer silently waved through by default.
 
 ## Install (standalone)
 
@@ -70,15 +70,21 @@ codex
 Activate in a session. In Codex, send the same command as a normal prompt line:
 
 ```
-/reflect-and-refine activate
+/rnr activate
 ```
 
-Any subsequent stop will trigger the review until you `/reflect-and-refine shutdown`.
+To force a specific review scenario for the session, use:
+
+```
+/rnr coding
+```
+
+Any subsequent stop will trigger the review until you `/rnr shutdown`. Legacy `/reflect-and-refine ...` commands still work.
 
 ### Quick-start control panel
 
 ```
-/reflect-and-refine configure
+/rnr configure
 ```
 
 One interactive wizard covers everything most users need:
@@ -102,15 +108,16 @@ After this, invoking `/better-work`, `/better-code`, or `/better-test` will also
 
 | Command | Effect |
 |---------|--------|
-| `/reflect-and-refine activate` | Open the gate in this session (marker-only; no state file) |
-| `/reflect-and-refine shutdown` | Close the gate until re-activated |
-| `/reflect-and-refine status` | Show registry, rate limit, current turn block count |
-| **`/reflect-and-refine configure`** | **Interactive control panel — toggle skills on/off, enable/disable all, change scenario mapping, pause/unpause. Best starting point if unsure.** |
-| `/reflect-and-refine register <name> ...` | Append skills to the registry (CLI-style shortcut for `configure → option 1`) |
-| `/reflect-and-refine unregister <name> ...` | Remove skills from the registry |
-| `/reflect-and-refine rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
-| `/reflect-and-refine audit [<N>]` | Print last N audit entries (default 5). See `~/.reflect-and-refine/audit.md` for full history. |
-| `/reflect-and-refine customize [<skill>]` | Interactive wizard to tune the reviewer (language, strictness, dimensions, project-specific checks) for one skill or the global default. Writes a structured markdown file with YAML frontmatter + placeholders. |
+| `/rnr activate` | Open the gate in this session (marker-only; no state file) |
+| `/rnr <scenario>` | Open the gate and set the explicit review scenario for this session, for example `/rnr coding` |
+| `/rnr shutdown` | Close the gate until re-activated |
+| `/rnr status` | Show registry, rate limit, current turn block count |
+| **`/rnr configure`** | **Interactive control panel — toggle skills on/off, enable/disable all, change scenario mapping, pause/unpause. Best starting point if unsure.** |
+| `/rnr register <name> ...` | Append skills to the registry (CLI-style shortcut for `configure → option 1`) |
+| `/rnr unregister <name> ...` | Remove skills from the registry |
+| `/rnr rate-limit [<N>]` | Get or set `max_blocks_per_turn`. Range 1–5 silent, 6–20 warns, >20 requires `--force`. 0/negative rejected (use `.paused` instead). |
+| `/rnr audit [<N>]` | Print last N audit entries (default 5). See `~/.reflect-and-refine/audit.md` for full history. |
+| `/rnr customize [<skill>]` | Interactive wizard to tune the reviewer (language, strictness, dimensions, project-specific checks) for one skill or the global default. Writes a structured markdown file with YAML frontmatter + placeholders. |
 
 ## Integration with parent skills
 
@@ -137,8 +144,8 @@ Config example:
   "reviewer": {
     "trigger_mode": "intent_sensitive",
     "trigger_mode_by_scenario": {
-      "coding": "claim_done_only",
-      "testing": "claim_done_only",
+      "coding": "intent_sensitive",
+      "testing": "intent_sensitive",
       "debugging": "intent_sensitive",
       "general": "intent_sensitive"
     }
@@ -148,7 +155,7 @@ Config example:
 
 ## Emergency shutdown (from any shell)
 
-If the `/reflect-and-refine` command isn't available in the current session yet, you still have two kill switches that work from outside the agent client:
+If the `/rnr` command isn't available in the current session yet, you still have two kill switches that work from outside the agent client:
 
 ```bash
 # Pause the hook (file-based kill switch — hook checks before any work)
@@ -195,7 +202,7 @@ User state:
 ├── prompts/
 │   ├── default.md             # user-level default reviewer (seeded on install, hand-editable)
 │   └── overrides/
-│       └── <skill>.md         # per-skill override (created by `/reflect-and-refine customize <skill>`)
+│       └── <skill>.md         # per-skill override (created by `/rnr customize <skill>`)
 ├── .paused                    # (optional) kill-switch flag file
 └── logs/                      # error logs (hook is fail-open, logs for debugging)
 ```
@@ -222,14 +229,14 @@ Each lives at `<install_root>/prompts/scenarios/<name>.md` (bundled) or `~/.refl
 ### Three ways to customise
 
 1. **Quickest — frontmatter edit**: open the scenario file (or default.md), change `language`, `strictness`, `model`, or the `dimensions` list. Takes effect on the next Stop event (hook rereads on every fire).
-2. **Guided — fully interactive wizard**: `/reflect-and-refine customize` (no args) — agent asks "default / scenario / skill?" then walks you through language, strictness, model, dimensions, custom checks. Every step has a default; you can just accept. Works for any target type.
+2. **Guided — fully interactive wizard**: `/rnr customize` (no args) — agent asks "default / scenario / skill?" then walks you through language, strictness, model, dimensions, custom checks. Every step has a default; you can just accept. Works for any target type.
 3. **Power-user — hand-written body**: copy `<install_root>/prompts/scenarios/general.md` as a starting point, rewrite role text / verdict schema / action protocol. Placeholders honoured by the hook: `{USER_REQUEST}`, `{AGENT_RESPONSE}`, `{LANGUAGE}`, `{STRICTNESS_DIRECTIVE}`, `{MODEL_PREFERENCE_PARAM}`, `{DIMENSIONS_BLOCK}`, `{CUSTOM_CHECKS_BLOCK}`.
 
 ### Adding a new scenario
 
 ```
-/reflect-and-refine customize scenario          # wizard; type a new name when prompted
-/reflect-and-refine map my-research-skill research   # route the skill to it
+/rnr customize scenario          # wizard; type a new name when prompted
+/rnr map my-research-skill research   # route the skill to it
 ```
 
 The scenario file lives at `~/.reflect-and-refine/prompts/scenarios/<name>.md` and is edited like any built-in.
@@ -237,7 +244,7 @@ The scenario file lives at `~/.reflect-and-refine/prompts/scenarios/<name>.md` a
 ### Mapping a new skill
 
 ```
-/reflect-and-refine map <skill> <scenario>
+/rnr map <skill> <scenario>
 ```
 
 Or edit `config.json` → `reviewer.skill_scenario_map.<skill>` directly. Unmapped skills fall through to `default.md`.
@@ -259,10 +266,10 @@ Layers 1–2 are escape hatches; layer 3 (scenario) is the main path.
 ### Pinning: scope the gate to one scenario or skill
 
 ```
-/reflect-and-refine pin coding               # only skills mapped to coding trigger
-/reflect-and-refine pin scenario testing     # same, explicit
-/reflect-and-refine pin skill better-test    # only /better-test triggers (escape hatch)
-/reflect-and-refine unpin                    # clear
+/rnr pin coding               # only skills mapped to coding trigger
+/rnr pin scenario testing     # same, explicit
+/rnr pin skill better-test    # only /better-test triggers (escape hatch)
+/rnr unpin                    # clear
 ```
 
 ### Built-in dimensions (used inside scenarios / default / skill overrides)

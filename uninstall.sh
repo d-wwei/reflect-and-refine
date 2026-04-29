@@ -63,8 +63,11 @@ command -v jq >/dev/null 2>&1 || die "jq is required."
 
 # Remove skill symlinks if they point to our dir
 remove_skill_link "$HOME/.claude/skills/reflect-and-refine" "claude-code"
+remove_skill_link "$HOME/.claude/skills/rnr" "claude-code-alias"
 remove_skill_link "$HOME/.codex/skills/reflect-and-refine" "codex-legacy"
+remove_skill_link "$HOME/.codex/skills/rnr" "codex-legacy-alias"
 remove_skill_link "$HOME/.agents/skills/reflect-and-refine" "codex-canonical"
+remove_skill_link "$HOME/.agents/skills/rnr" "codex-canonical-alias"
 
 if [ -n "$SETTINGS_FILE" ] && [ -f "$SETTINGS_FILE" ]; then
   BACKUP="$SETTINGS_FILE.bak.$(date +%s).rar-uninstall"

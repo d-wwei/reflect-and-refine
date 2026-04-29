@@ -1,5 +1,5 @@
 ---
-name: reflect-and-refine
+name: rnr
 description: |
   Adversarial completion review at agent Stop time. When an active skill's gate is open,
   every time the main agent tries to stop, a mandatory adversarial review step runs to
@@ -7,6 +7,7 @@ description: |
   Use when: (1) you keep catching agents claiming "done" with hidden gaps;
   (2) you want a mechanical enforcement of completion standards on top of written
   protocols. Works in Claude Code and Codex; integrates loosely with any parent skill via registration.
+  Primary command: /rnr. Legacy alias /reflect-and-refine remains supported.
   Subcommands: configure, status, shutdown, activate, register, unregister, audit, rate-limit, customize, pin, unpin, map.
 ---
 
@@ -25,15 +26,16 @@ A per-session "gate" decides whether the review fires on a given Stop event.
 
 | Command | Effect |
 |---------|--------|
-| `/reflect-and-refine shutdown` | CLOSE |
-| `/reflect-and-refine activate` (or empty args) | OPEN |
-| `/reflect-and-refine status` / `audit` / `rate-limit` / `register` / `unregister` / `customize` / `pin` / `unpin` | **transparent** — gate state unchanged |
+| `/rnr shutdown` | CLOSE |
+| `/rnr activate` (or empty args) | OPEN |
+| `/rnr <scenario>` (for example `/rnr coding`) | OPEN and set the explicit review scenario |
+| `/rnr status` / `audit` / `rate-limit` / `register` / `unregister` / `customize` / `pin` / `unpin` | **transparent** — gate state unchanged |
 | `/<any-registered-parent-skill>` (e.g. `/better-work`, `/better-code`, `/better-test`) | OPEN |
 | no command markers in transcript | CLOSED |
 
-**Pin filter** (applied after gate-state decision): if a `/reflect-and-refine pin <skill>` directive is active, the hook fires only when the triggering skill equals `<skill>`. Other registered skills still appear in the transcript but are silently skipped. `/reflect-and-refine unpin` clears the filter.
+**Pin filter** (applied after gate-state decision): if a `/rnr pin <skill>` directive is active, the hook fires only when the triggering skill equals `<skill>`. Other registered skills still appear in the transcript but are silently skipped. `/rnr unpin` clears the filter.
 
-Query/config subcommands of reflect-and-refine itself are intentionally transparent — running `/reflect-and-refine status` after a `shutdown` keeps the gate closed; running `/reflect-and-refine audit` in the middle of an active session keeps the gate open.
+Query/config subcommands of reflect-and-refine itself are intentionally transparent — running `/rnr status` after a `shutdown` keeps the gate closed; running `/rnr audit` in the middle of an active session keeps the gate open.
 
 **Rate limit**: within a single user turn, the gate blocks at most `max_blocks_per_turn` times (default 3). After that it allows the stop so you can break out of loops.
 
@@ -50,7 +52,7 @@ That stop intent is then combined with the current scenario. In practice this me
 
 ## Subcommands
 
-### `/reflect-and-refine configure`
+### `/rnr configure`
 
 **One-stop control panel**. Fully interactive — use this when you're not sure which specific subcommand to run. Shows the live state, offers one-click enable/disable, per-skill toggle, scenario mapping adjustment, and global pause/unpause.
 
@@ -94,7 +96,7 @@ That stop intent is then combined with the current scenario. In practice this me
    | 4 | **Change scenario mapping** | For each registered skill show current scenario; ask which to change; offer `coding / testing / debugging / general / <new>` |
    | 5 | **Pause the hook globally** | `touch ~/.reflect-and-refine/.paused`; all sessions silent until unpause |
    | 6 | **Unpause** | `rm ~/.reflect-and-refine/.paused` |
-   | 7 | **Adjust rate limit** | Short-circuit to `/reflect-and-refine rate-limit <N>` logic |
+   | 7 | **Adjust rate limit** | Short-circuit to `/rnr rate-limit <N>` logic |
    | 8 | **Cancel** | Exit without changes |
 
 4. **Apply change** — after user picks, run the sub-dialog for that option. Each sub-dialog ends with **preview + confirm** before writing anything. All changes use `jq` merge that preserves unknown fields in `config.json`.
@@ -131,7 +133,7 @@ That stop intent is then combined with the current scenario. In practice this me
 
 **Option 7 — Rate limit**:
 - Ask for N.
-- Apply the same validation as `/reflect-and-refine rate-limit`: reject 0/negative, accept 1–5 silent, 6–20 warn, >20 require `--force`.
+- Apply the same validation as `/rnr rate-limit`: reject 0/negative, accept 1–5 silent, 6–20 warn, >20 require `--force`.
 
 **Principles** (same as customize):
 - Never assume. Ask.
@@ -140,28 +142,39 @@ That stop intent is then combined with the current scenario. In practice this me
 - Confirm before writing.
 - All writes via jq merge — preserve unknown fields.
 
-### `/reflect-and-refine activate`
+### `/rnr activate`
 Open the gate in this session without invoking another skill. A no-op convenience command —
 the invocation itself leaves a marker in the transcript that the hook recognizes.
 
-### `/reflect-and-refine shutdown`
-Close the gate for the remainder of the session. Emits a shutdown marker. Can be reopened by
-invoking any registered skill again (including `/reflect-and-refine activate`).
+### `/rnr <scenario>`
+Open the gate and set an explicit scenario override for the session.
 
-### `/reflect-and-refine pin <scenario-or-skill>`
+Examples:
+```
+/rnr coding
+/rnr testing
+```
+
+This is the shortest way to say "review me as coding/testing/debugging/general work even if the last opener wasn't that exact skill".
+
+### `/rnr shutdown`
+Close the gate for the remainder of the session. Emits a shutdown marker. Can be reopened by
+invoking any registered skill again (including `/rnr activate`).
+
+### `/rnr pin <scenario-or-skill>`
 Scope the gate to a **scenario** (preferred) or a **specific skill**. Default interpretation is scenario — explicit skill pinning requires the `skill` keyword.
 
 **Scenario pin** (recommended — stable across skill churn):
 ```
-/reflect-and-refine pin coding        # scope gate to any skill mapped to coding
-/reflect-and-refine pin scenario coding   # same, explicit
-/reflect-and-refine pin testing
+/rnr pin coding        # scope gate to any skill mapped to coding
+/rnr pin scenario coding   # same, explicit
+/rnr pin testing
 ```
 The gate fires only for skills whose `skill_scenario_map` entry equals the pinned scenario. Unmapped skills (no scenario) will NOT trigger while a scenario pin is active.
 
 **Skill pin** (escape hatch — use only when one specific skill needs isolation):
 ```
-/reflect-and-refine pin skill better-code    # only /better-code triggers; other skills quiet
+/rnr pin skill better-code    # only /better-code triggers; other skills quiet
 ```
 
 **Use cases**:
@@ -169,22 +182,22 @@ The gate fires only for skills whose `skill_scenario_map` entry equals the pinne
 - Debugging an incident: `pin debugging` → all debugging skills audited strictly; coding changes made during triage audited by their own scenario.
 - Isolating one tool: `pin skill better-test` → only `/better-test` audited.
 
-### `/reflect-and-refine unpin`
+### `/rnr unpin`
 Clear any active pin — gate returns to "any registered skill triggers". Last pin/unpin directive in the transcript wins.
 
-### `/reflect-and-refine map <skill> <scenario>`
+### `/rnr map <skill> <scenario>`
 Add or update a skill → scenario mapping in `~/.reflect-and-refine/config.json`. Enables scenario-based routing and scenario pins to include this skill.
 
 ```
-/reflect-and-refine map my-custom-coder coding      # route my-custom-coder through coding.md
-/reflect-and-refine map my-qa-assistant testing
+/rnr map my-custom-coder coding      # route my-custom-coder through coding.md
+/rnr map my-qa-assistant testing
 ```
 
 When invoked: read config, set `reviewer.skill_scenario_map.<skill> = <scenario>`, write back preserving other fields. If `<scenario>` is not one of the built-in scenarios (coding / testing / debugging / general / or whatever files exist in `prompts/scenarios/`), warn but allow — the user may be about to create a new scenario file.
 
 To remove a mapping, use `map <skill>` with no scenario, or edit config.json directly.
 
-### `/reflect-and-refine status`
+### `/rnr status`
 Show the current gate state, registered skills, per-turn block count, and whether any kill switch is active.
 
 When invoked, read `~/.reflect-and-refine/config.json` and report:
@@ -195,21 +208,21 @@ When invoked, read `~/.reflect-and-refine/config.json` and report:
 - Whether `~/.reflect-and-refine/.paused` exists (kill switch #1 active)
 - Whether `RAR_DISABLED` env var is set on the current agent process (kill switch #2 active — inspect via the runtime's available env/process context if possible, else state it's unverifiable from inside the agent)
 
-### `/reflect-and-refine register <skill-name> [<skill-name> ...]`
+### `/rnr register <skill-name> [<skill-name> ...]`
 Append one or more skill names to the registered list in `~/.reflect-and-refine/config.json`.
 After registration, invoking any of those skills opens the gate.
 
 When invoked: read config, append names (de-duplicated), write back. Preserve unknown fields.
 
-### `/reflect-and-refine unregister <skill-name> [<skill-name> ...]`
+### `/rnr unregister <skill-name> [<skill-name> ...]`
 Remove skill names from the registered list.
 
-### `/reflect-and-refine audit [<N>]`
+### `/rnr audit [<N>]`
 Print the last N audit entries from `~/.reflect-and-refine/audit.md` (default N=5). Each hook fire that resulted in BLOCKED or RATE-LIMITED is recorded there with: timestamp, session, counter state, gate trigger, and head excerpts of the user request and agent response. Use this to see whether the hook is actually firing and what it saw — it is the primary visibility surface for human users.
 
 If no audit file exists, say so (means the hook has never fired, or was always paused/closed).
 
-### `/reflect-and-refine customize [<target-spec>]`
+### `/rnr customize [<target-spec>]`
 
 Fully interactive, guided wizard to create or edit a reviewer prompt. **Every entry point is dialog-driven** — the agent asks questions rather than assuming intent. Optional positional args shortcut the first step only.
 
@@ -217,12 +230,12 @@ Fully interactive, guided wizard to create or edit a reviewer prompt. **Every en
 
 | Form | First dialog step |
 |------|------------------|
-| `/reflect-and-refine customize` | "What would you like to customise? (default / scenario / skill)" |
-| `/reflect-and-refine customize default` | Skip to default-edit dialog |
-| `/reflect-and-refine customize scenario` | "Which scenario? (coding / testing / debugging / general / new)" |
-| `/reflect-and-refine customize scenario coding` | Skip to coding-edit dialog |
-| `/reflect-and-refine customize skill` | "Which skill do you want a per-skill override for?" |
-| `/reflect-and-refine customize skill better-code` | Skip to skill-override dialog |
+| `/rnr customize` | "What would you like to customise? (default / scenario / skill)" |
+| `/rnr customize default` | Skip to default-edit dialog |
+| `/rnr customize scenario` | "Which scenario? (coding / testing / debugging / general / new)" |
+| `/rnr customize scenario coding` | Skip to coding-edit dialog |
+| `/rnr customize skill` | "Which skill do you want a per-skill override for?" |
+| `/rnr customize skill better-code` | Skip to skill-override dialog |
 
 **Three target types and where the file lands**:
 
@@ -270,7 +283,7 @@ Fully interactive, guided wizard to create or edit a reviewer prompt. **Every en
 - **Be forgiving of target typos**: if the user says "scenario codeing" and there's no `codeing.md` in scenarios/, ask: "No scenario named 'codeing' exists. Create new / did you mean 'coding'?"
 - **Mention scenario vs skill trade-off**: when user invokes `customize skill <x>`, remind: "Most users are better served by customising a scenario. Are you sure you want a per-skill override?" unless the answer is obvious.
 
-### `/reflect-and-refine rate-limit [<N>] [--force]`
+### `/rnr rate-limit [<N>] [--force]`
 Get or set `max_blocks_per_turn` — how many times the hook may block consecutively within one user turn before giving up and allowing the stop.
 
 - **No argument** → print the current value.
@@ -290,14 +303,14 @@ Stored in `~/.reflect-and-refine/config.json`:
 
 ```json
 {
-  "registered_skills": ["reflect-and-refine", "better-work", "better-code", "better-test"],
+  "registered_skills": ["rnr", "reflect-and-refine", "better-work", "better-code", "better-test"],
   "max_blocks_per_turn": 3,
   "suppress_output": true,
   "reviewer": {
     "trigger_mode": "intent_sensitive",
     "trigger_mode_by_scenario": {
-      "coding": "claim_done_only",
-      "testing": "claim_done_only",
+      "coding": "intent_sensitive",
+      "testing": "intent_sensitive",
       "debugging": "intent_sensitive",
       "general": "intent_sensitive"
     },
@@ -311,7 +324,7 @@ Stored in `~/.reflect-and-refine/config.json`:
 }
 ```
 
-**`skill_scenario_map`** (main routing): skill name → scenario name. The hook looks up the scenario at trigger time and uses `prompts/scenarios/<scenario>.md`. Update via `/reflect-and-refine map <skill> <scenario>`.
+**`skill_scenario_map`** (main routing): skill name → scenario name. The hook looks up the scenario at trigger time and uses `prompts/scenarios/<scenario>.md`. Update via `/rnr map <skill> <scenario>`.
 
 **`reviewer.per_skill`** (escape hatch): skill name → absolute or relative path to a specific prompt file. Takes precedence over scenario lookup. Use when one skill needs treatment completely different from its domain scenario.
 
@@ -324,7 +337,7 @@ Stored in `~/.reflect-and-refine/config.json`:
 
 ## Emergency shutdown (without a slash command)
 
-If you're in a session that was started BEFORE `reflect-and-refine` was installed, the command marker may not be available yet and `/reflect-and-refine shutdown` won't work. Two escape hatches work from any shell:
+If you're in a session that was started BEFORE `reflect-and-refine` was installed, the command marker may not be available yet and `/rnr shutdown` won't work. Two escape hatches work from any shell:
 
 1. **Pause flag file** — the hook checks for `~/.reflect-and-refine/.paused` before doing any work. If present, it exits silently:
    ```bash

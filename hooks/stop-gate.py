@@ -43,14 +43,22 @@ SHUTDOWN_MARKER_ARGS = "shutdown"
 DEFAULT_MAX_BLOCKS_PER_TURN = 3
 AUDIT_HEAD_MAX = 150  # chars to show in audit excerpts
 CONTROL_SKILL = "reflect-and-refine"
+CONTROL_ALIASES = {CONTROL_SKILL, "rnr"}
+CONTROL_COMMAND_DISPLAY = "/rnr"
 DEFAULT_STOP_INTENT = "checkpoint_update"
 DEFAULT_TRIGGER_MODE = "intent_sensitive"
 VALID_TRIGGER_MODES = {"always", "claim_done_only", "intent_sensitive"}
+DEFAULT_SCENARIO_NAMES = {"general", "coding", "testing", "debugging"}
 
 # Dimension snippets: {dimension_name: {strictness: text}}. Rendered into the
 # {DIMENSIONS_BLOCK} slot based on frontmatter config. Keep each snippet to
 # one numbered line so the assembled block reads as an ordered list.
 DIMENSION_SNIPPETS = {
+    "skill_compliance": {
+        "lenient": "Does the response broadly follow the triggering skill's workflow and red-line constraints?",
+        "default": "Did the agent follow the triggering skill's required workflow, red lines, and completion rules before trying to stop? If the skill says to keep going, checkpoint differently, or avoid asking the user early, enforce that.",
+        "strict": "Treat the triggering skill's workflow and red lines as first-class requirements. If the response violates the skill protocol, this is a failure even if the end result sounds plausible.",
+    },
     "requirement_split": {
         "lenient": "Is every major requirement in the user's request identified?",
         "default": "Is every distinct requirement in the user's request enumerated?",
@@ -110,6 +118,28 @@ IDEMPOTENT_RAR_SUBCOMMANDS = {
     # the gate — they're directives scanned separately by find_pinned_skill.
     "pin", "unpin",
 }
+
+
+def canonicalize_command_name(skill: str) -> str:
+    if skill in CONTROL_ALIASES:
+        return CONTROL_SKILL
+    return skill
+
+
+def known_scenario_names(config: Optional[dict] = None) -> set[str]:
+    names = set(DEFAULT_SCENARIO_NAMES)
+    for directory in (USER_SCENARIOS_DIR, BUNDLED_SCENARIOS_DIR):
+        try:
+            if directory.exists():
+                names.update(p.stem for p in directory.glob("*.md"))
+        except Exception:
+            pass
+    if isinstance(config, dict):
+        reviewer_cfg = config.get("reviewer", {}) if isinstance(config.get("reviewer"), dict) else {}
+        ssm = reviewer_cfg.get("skill_scenario_map", {})
+        if isinstance(ssm, dict):
+            names.update(v.strip() for v in ssm.values() if isinstance(v, str) and v.strip())
+    return names
 
 
 def log_error(msg: str) -> None:
@@ -280,7 +310,7 @@ def extract_command_invocation(text: str) -> tuple[str, str]:
     if m:
         args_match = args_pat.search(text)
         args = args_match.group(1).strip() if args_match else ""
-        return m.group(1), args
+        return canonicalize_command_name(m.group(1)), args
 
     stripped = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL).strip()
     if not stripped:
@@ -289,7 +319,7 @@ def extract_command_invocation(text: str) -> tuple[str, str]:
     m = re.match(r"^/([\w-]+)(?:\s+(.*))?$", first_line)
     if not m:
         return "", ""
-    return m.group(1), (m.group(2) or "").strip()
+    return canonicalize_command_name(m.group(1)), (m.group(2) or "").strip()
 
 
 def is_real_user_record(rec: dict) -> bool:
@@ -311,7 +341,7 @@ def is_real_user_record(rec: dict) -> bool:
     return True
 
 
-def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, str]:
+def gate_state(records: list[dict], registered_skills: set[str], known_scenarios: Optional[set[str]] = None) -> tuple[str, str]:
     """
     Scan real user records from newest to oldest. Return (state, triggered_skill).
     - state: 'OPEN' or 'CLOSED'
@@ -319,12 +349,14 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, s
       Used downstream for per-skill prompt routing.
 
     Rules (last matching real-user command wins; query subcommands are transparent):
-    - /reflect-and-refine shutdown              -> CLOSED
-    - /reflect-and-refine activate | (no args)  -> OPEN, triggered_skill="reflect-and-refine"
-    - /reflect-and-refine <idempotent-query>    -> skip (doesn't change state)
+    - /rnr shutdown                             -> CLOSED
+    - /rnr activate | (no args)                 -> OPEN, triggered_skill="reflect-and-refine"
+    - /rnr <scenario>                           -> OPEN, triggered_skill="reflect-and-refine"
+    - /rnr <idempotent-query>                   -> skip (doesn't change state)
     - /<any-other-registered-skill>             -> OPEN, triggered_skill=<skill>
     - no markers found                          -> CLOSED
     """
+    known_scenarios = known_scenarios or set(DEFAULT_SCENARIO_NAMES)
     for rec in reversed(records):
         if not is_real_user_record(rec):
             continue
@@ -333,11 +365,17 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, s
         if not skill:
             continue
 
-        if skill == CONTROL_SKILL:
-            first_arg = args.split()[0] if args else ""
+        if canonicalize_command_name(skill) == CONTROL_SKILL:
+            parts = args.split()
+            first_arg = parts[0] if parts else ""
+            second_arg = parts[1] if len(parts) >= 2 else ""
             if first_arg == SHUTDOWN_MARKER_ARGS:
                 return "CLOSED", ""
             if first_arg == "" or first_arg == "activate":
+                return "OPEN", CONTROL_SKILL
+            if first_arg in known_scenarios:
+                return "OPEN", CONTROL_SKILL
+            if first_arg == "activate" and second_arg in known_scenarios:
                 return "OPEN", CONTROL_SKILL
             if first_arg in IDEMPOTENT_RAR_SUBCOMMANDS:
                 continue  # query/config — transparent to gate state
@@ -348,6 +386,37 @@ def gate_state(records: list[dict], registered_skills: set[str]) -> tuple[str, s
         if skill in registered_skills:
             return "OPEN", skill
     return "CLOSED", ""
+
+
+def find_session_scenario_override(records: list[dict], known_scenarios: set[str]) -> str:
+    """
+    Track explicit scenario activation markers set via the control command.
+
+    Supported forms:
+      /rnr coding
+      /rnr activate coding
+      /rnr activate          -> clear explicit override
+      /rnr shutdown          -> clear explicit override
+    """
+    for rec in reversed(records):
+        if not is_real_user_record(rec):
+            continue
+        norm = normalized_message_record(rec)
+        skill, args = extract_command_invocation(norm["content"] if norm else "")
+        if canonicalize_command_name(skill) != CONTROL_SKILL:
+            continue
+        parts = args.split()
+        first_arg = parts[0] if parts else ""
+        second_arg = parts[1] if len(parts) >= 2 else ""
+        if first_arg in {"", "activate", SHUTDOWN_MARKER_ARGS}:
+            if first_arg == "activate" and second_arg in known_scenarios:
+                return second_arg
+            return ""
+        if first_arg in known_scenarios:
+            return first_arg
+        if first_arg in IDEMPOTENT_RAR_SUBCOMMANDS:
+            continue
+    return ""
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -469,6 +538,104 @@ def scenario_for_skill(triggered_skill: str, config: dict) -> str:
         if isinstance(val, str):
             return val.strip()
     return ""
+
+
+def skill_doc_candidates(triggered_skill: str) -> list[Path]:
+    canon = canonicalize_command_name(triggered_skill or "")
+    names: list[str] = []
+    for name in (triggered_skill, canon):
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    if canon == CONTROL_SKILL:
+        for name in (CONTROL_SKILL, "rnr"):
+            if name not in names:
+                names.append(name)
+
+    candidates: list[Path] = []
+    if canon == CONTROL_SKILL:
+        candidates.append(SKILL_ROOT / "SKILL.md")
+    for base in (HOME / ".claude" / "skills", HOME / ".codex" / "skills", HOME / ".agents" / "skills"):
+        for name in names:
+            candidates.append(base / name / "SKILL.md")
+    return candidates
+
+
+def load_skill_protocol_excerpt(triggered_skill: str) -> tuple[str, str]:
+    """
+    Return (source_path, excerpt_text) for the triggering skill's protocol.
+    Excerpt is intentionally short and biased toward actionable workflow rules.
+    """
+    for candidate in skill_doc_candidates(triggered_skill):
+        try:
+            if not candidate.exists():
+                continue
+            full = candidate.read_text()
+            _fm, body = parse_frontmatter(full)
+            lines: list[str] = []
+            for raw in body.splitlines():
+                text = raw.strip()
+                if not text or text.startswith("#") or text.startswith("|"):
+                    continue
+                lines.append(text)
+
+            interesting: list[str] = []
+            seen: set[str] = set()
+            patterns = (
+                r"\bmust\b",
+                r"\bshould\b",
+                r"\bdo not\b",
+                r"\bdon't\b",
+                r"\bnever\b",
+                r"\balways\b",
+                r"\brequired\b",
+                r"\bkeep going\b",
+                r"\bcontinue\b",
+                r"\bcheckpoint\b",
+                r"\bask\b",
+                r"\bstop\b",
+                r"不要",
+                r"必须",
+                r"继续",
+                r"停",
+            )
+            for text in lines:
+                lowered = text.lower()
+                if any(re.search(pat, lowered) for pat in patterns):
+                    clipped = text[:180]
+                    if clipped not in seen:
+                        interesting.append(clipped)
+                        seen.add(clipped)
+                if len(interesting) >= 6:
+                    break
+            if not interesting:
+                interesting = [line[:180] for line in lines[:4]]
+            return str(candidate), "\n".join(f"- {line}" for line in interesting if line)
+        except Exception:
+            continue
+    return "", ""
+
+
+def build_skill_protocol_block(triggered_skill: str, triggered_scenario: str) -> str:
+    source, excerpt = load_skill_protocol_excerpt(triggered_skill)
+    if canonicalize_command_name(triggered_skill or "") == CONTROL_SKILL:
+        display_skill = CONTROL_COMMAND_DISPLAY
+    else:
+        display_skill = f"/{triggered_skill}" if triggered_skill else CONTROL_COMMAND_DISPLAY
+    lines = [
+        "First priority before any completion judgment:",
+        f"- Verify whether the agent followed the triggering skill protocol for `{display_skill}`.",
+        "- If the skill says to keep working, avoid asking the user early, or use a specific checkpoint style, enforce that before judging completeness.",
+    ]
+    if triggered_scenario:
+        lines.append(f"- Current effective review scenario: `{triggered_scenario}`.")
+    if excerpt:
+        rendered_source = source.replace(str(HOME), "~")
+        lines.append(f"- Protocol source: `{rendered_source}`")
+        lines.append("Relevant protocol excerpts:")
+        lines.append(excerpt)
+    else:
+        lines.append("- No external skill protocol excerpt was found; fall back to the scenario rules and the user request.")
+    return "\n".join(lines)
 
 
 def humanize_stop_intent(stop_intent: str) -> str:
@@ -612,7 +779,7 @@ def should_review_stop_intent(stop_intent: str, trigger_mode: str) -> bool:
     }
 
 
-def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
+def resolve_prompt_path(triggered_skill: str, config: dict, triggered_scenario: str = "") -> Path:
     """
     Five-layer fallback (highest precedence first):
       1. config.reviewer.per_skill.<skill>                    (explicit file mapping)
@@ -642,7 +809,7 @@ def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
             return override
 
     # Layer 3: scenario lookup (the main path — matches user mental model)
-    scenario = scenario_for_skill(triggered_skill, config)
+    scenario = triggered_scenario or scenario_for_skill(triggered_skill, config)
     if scenario:
         user_scenario = USER_SCENARIOS_DIR / f"{scenario}.md"
         if user_scenario.exists():
@@ -659,13 +826,24 @@ def resolve_prompt_path(triggered_skill: str, config: dict) -> Path:
     return BUNDLED_PROMPT
 
 
-def resolve_intent_prompt_path(stop_intent: str) -> Optional[Path]:
-    user_prompt = USER_INTENTS_DIR / f"{stop_intent}.md"
-    if user_prompt.exists():
-        return user_prompt
-    bundled_prompt = BUNDLED_INTENTS_DIR / f"{stop_intent}.md"
-    if bundled_prompt.exists():
-        return bundled_prompt
+def resolve_intent_prompt_path(stop_intent: str, triggered_scenario: str = "") -> Optional[Path]:
+    candidates: list[Path] = []
+    if triggered_scenario:
+        candidates.extend(
+            [
+                USER_INTENTS_DIR / f"{stop_intent}-{triggered_scenario}.md",
+                BUNDLED_INTENTS_DIR / f"{stop_intent}-{triggered_scenario}.md",
+            ]
+        )
+    candidates.extend(
+        [
+            USER_INTENTS_DIR / f"{stop_intent}.md",
+            BUNDLED_INTENTS_DIR / f"{stop_intent}.md",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -688,7 +866,7 @@ def find_pin_directive(records: list) -> tuple:
             continue
         norm = normalized_message_record(rec)
         skill, args = extract_command_invocation(norm["content"] if norm else "")
-        if skill != CONTROL_SKILL:
+        if canonicalize_command_name(skill) != CONTROL_SKILL:
             continue
         parts = args.split()
         if not parts:
@@ -756,10 +934,11 @@ def last_user_command_parts(records: list[dict], fallback_assistant_text: str = 
     user_rec = normalized_message_record(records[last_user_idx]) or {}
     content = user_rec.get("content", "")
     skill, args = extract_command_invocation(content)
+    display_skill = CONTROL_COMMAND_DISPLAY[1:] if skill == CONTROL_SKILL else skill
     if skill and args:
-        request_text = f"/{skill} {args}"
+        request_text = f"/{display_skill} {args}"
     elif skill:
-        request_text = f"/{skill}"
+        request_text = f"/{display_skill}"
     else:
         cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", content, flags=re.DOTALL).strip()
         request_text = cleaned[:4000]
@@ -847,7 +1026,14 @@ def extract_reviewer_prompt_body(body: str) -> str:
     return body.strip()
 
 
-def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path, stop_intent: str) -> tuple:
+def build_reviewer_prompt(
+    request_text: str,
+    agent_text: str,
+    prompt_path: Path,
+    stop_intent: str,
+    triggered_skill: str = "",
+    triggered_scenario: str = "",
+) -> tuple:
     """
     Read the prompt file, parse frontmatter, substitute placeholders, and
     return (reviewer_prompt, model_param, frontmatter_dict). The returned
@@ -864,7 +1050,7 @@ def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path,
     intent_fm = {}
 
     if stop_intent != "final_completion":
-        intent_prompt_path = resolve_intent_prompt_path(stop_intent)
+        intent_prompt_path = resolve_intent_prompt_path(stop_intent, triggered_scenario)
         if intent_prompt_path is not None:
             intent_full = intent_prompt_path.read_text()
             intent_fm, intent_body = parse_frontmatter(intent_full)
@@ -892,6 +1078,8 @@ def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path,
         dimensions = []
     if not dimensions:
         dimensions = ["requirement_split", "evidence", "hedging", "silent_drops", "fake_evidence"]
+    if "skill_compliance" not in dimensions:
+        dimensions = ["skill_compliance", *dimensions]
 
     custom_checks = scenario_fm.get("custom_checks", intent_fm.get("custom_checks", []))
     if not isinstance(custom_checks, list):
@@ -905,9 +1093,12 @@ def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path,
         or intent_fm.get("focus")
         or "general work completion and evidence quality"
     )
+    skill_protocol_block = build_skill_protocol_block(triggered_skill, triggered_scenario)
 
     reviewer = (
-        reviewer_body
+        skill_protocol_block
+        + "\n\n"
+        + reviewer_body
         .replace("{USER_REQUEST}", request_text or "(transcript did not yield a clear user request — review based on the full transcript)")
         .replace("{AGENT_RESPONSE}", agent_text or "(no prior assistant text extracted)")
         .replace("{LANGUAGE}", language)
@@ -923,6 +1114,8 @@ def build_reviewer_prompt(request_text: str, agent_text: str, prompt_path: Path,
     meta["_intent_prompt_path"] = str(intent_prompt_path) if intent_prompt_path else ""
     meta["_stop_intent"] = stop_intent
     meta["_scenario_focus"] = scenario_focus
+    meta["_triggered_skill"] = triggered_skill
+    meta["_triggered_scenario"] = triggered_scenario
     return reviewer, model_preference_param, meta
 
 
@@ -992,19 +1185,35 @@ Act on the verdict:
 
 def detect_runtime(payload: dict, records: list[dict]) -> str:
     """Best-effort runtime detection for dual Claude Code / Codex support."""
-    if payload.get("turn_id") or payload.get("last_assistant_message") or payload.get("hook_event_name"):
+    if payload.get("turn_id") or payload.get("last_assistant_message"):
         return "codex"
     if any(rec.get("type") == "response_item" for rec in records):
         return "codex"
     return "claude"
 
 
-def build_block_reason(request_text: str, agent_text: str, prompt_path: Path, session_id: str, runtime: str, stop_intent: str) -> tuple:
+def build_block_reason(
+    request_text: str,
+    agent_text: str,
+    prompt_path: Path,
+    session_id: str,
+    runtime: str,
+    stop_intent: str,
+    triggered_skill: str = "",
+    triggered_scenario: str = "",
+) -> tuple:
     """
     Build the short reason emitted to the main agent, plus write the full
     reviewer prompt to the per-session file. Returns (short_reason, session_file_path).
     """
-    reviewer_prompt, model_param, _fm = build_reviewer_prompt(request_text, agent_text, prompt_path, stop_intent)
+    reviewer_prompt, model_param, _fm = build_reviewer_prompt(
+        request_text,
+        agent_text,
+        prompt_path,
+        stop_intent,
+        triggered_skill,
+        triggered_scenario,
+    )
     session_file = write_session_prompt_file(session_id, reviewer_prompt)
     sweep_old_session_files()
 
@@ -1055,6 +1264,7 @@ def main() -> None:
         return
 
     registered = set(config.get("registered_skills", []))
+    known_scenarios = known_scenario_names(config)
 
     try:
         records = read_transcript(Path(transcript_path))
@@ -1063,7 +1273,7 @@ def main() -> None:
         return
 
     try:
-        state, triggered_skill = gate_state(records, registered)
+        state, triggered_skill = gate_state(records, registered, known_scenarios)
     except Exception as e:
         log_error(f"gate_state failed: {e}")
         return
@@ -1082,14 +1292,21 @@ def main() -> None:
         pin_scope, pin_target = "", ""
 
     pin_description = "(no pin — all registered skills)"
+    scenario_override = ""
+    try:
+        scenario_override = find_session_scenario_override(records, known_scenarios)
+    except Exception as e:
+        log_error(f"find_session_scenario_override failed: {e}")
+        scenario_override = ""
+    effective_scenario = scenario_override or scenario_for_skill(triggered_skill, config) or "general"
+
     if pin_scope == "skill" and pin_target:
         pin_description = f"skill={pin_target}"
         if triggered_skill != pin_target:
             return
     elif pin_scope == "scenario" and pin_target:
-        triggered_scenario = scenario_for_skill(triggered_skill, config)
         pin_description = f"scenario={pin_target}"
-        if triggered_scenario != pin_target:
+        if effective_scenario != pin_target:
             return
 
     try:
@@ -1098,7 +1315,7 @@ def main() -> None:
             records, fallback_assistant_text=payload.get("last_assistant_message", "") or ""
         )
         stop_intent = classify_stop_intent(request_text, agent_text)
-        triggered_scenario = scenario_for_skill(triggered_skill, config) or "general"
+        triggered_scenario = effective_scenario
         trigger_mode = trigger_mode_for_scenario(triggered_scenario, config)
         if not should_review_stop_intent(stop_intent, trigger_mode):
             return
@@ -1137,7 +1354,7 @@ def main() -> None:
             )
             return
 
-        prompt_path = resolve_prompt_path(triggered_skill, config)
+        prompt_path = resolve_prompt_path(triggered_skill, config, triggered_scenario)
         reason, session_file = build_block_reason(
             request_text,
             agent_text,
@@ -1145,6 +1362,8 @@ def main() -> None:
             session_id or "unknown",
             runtime,
             stop_intent,
+            triggered_skill,
+            triggered_scenario,
         )
     except Exception as e:
         log_error(f"build reason failed: {e}")
@@ -1162,12 +1381,13 @@ def main() -> None:
         if suppress_output:
             out["suppressOutput"] = True
         print(json.dumps(out))
+        gate_trigger_display = CONTROL_COMMAND_DISPLAY if triggered_skill == CONTROL_SKILL else f"/{triggered_skill}"
         audit_log(
             "BLOCKED",
             session_id,
             {
                 "count": f"{prior_count + 1}/{max_blocks}",
-                "gate_trigger": f"/{triggered_skill} in transcript",
+                "gate_trigger": f"{gate_trigger_display} in transcript",
                 "triggered_scenario": triggered_scenario or "(unmapped)",
                 "stop_intent": stop_intent,
                 "trigger_mode": trigger_mode,

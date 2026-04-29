@@ -148,8 +148,8 @@ Usage:
 
 Defaults to auto-detecting ~/.claude/ft-settings.json or ~/.claude/settings.json.
 
-Installation always registers 'reflect-and-refine' itself. Additional skills registered
-via --register or later via /reflect-and-refine register will also open the gate when
+Installation always registers 'rnr' (plus the legacy 'reflect-and-refine' alias). Additional skills registered
+via --register or later via /rnr register will also open the gate when
 invoked.
 
 Claude Code hooks are installed into the detected settings JSON.
@@ -170,8 +170,11 @@ chmod +x "$HOOK_SCRIPT"
 
 # Install skill links for both Claude Code and Codex.
 ensure_symlink "$HOME/.claude/skills/reflect-and-refine" "$SKILL_ROOT" "claude-code"
+ensure_symlink "$HOME/.claude/skills/rnr" "$SKILL_ROOT" "claude-code-alias"
 ensure_symlink "$HOME/.codex/skills/reflect-and-refine" "$SKILL_ROOT" "codex-legacy"
+ensure_symlink "$HOME/.codex/skills/rnr" "$SKILL_ROOT" "codex-legacy-alias"
 ensure_symlink "$HOME/.agents/skills/reflect-and-refine" "$SKILL_ROOT" "codex-canonical"
+ensure_symlink "$HOME/.agents/skills/rnr" "$SKILL_ROOT" "codex-canonical-alias"
 
 SETTINGS_FILE="${SETTINGS_FILE:-$(detect_settings)}"
 SETTINGS_DIR="$(dirname "$SETTINGS_FILE")"
@@ -255,14 +258,14 @@ mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/prompts/overrides" "$CONFIG_DIR/prompts/scen
 if [ ! -f "$CONFIG_FILE" ]; then
   cat > "$CONFIG_FILE" <<'JSON'
 {
-  "registered_skills": ["reflect-and-refine"],
+  "registered_skills": ["rnr", "reflect-and-refine"],
   "max_blocks_per_turn": 3,
   "suppress_output": true,
   "reviewer": {
     "trigger_mode": "intent_sensitive",
     "trigger_mode_by_scenario": {
-      "coding": "claim_done_only",
-      "testing": "claim_done_only",
+      "coding": "intent_sensitive",
+      "testing": "intent_sensitive",
       "debugging": "intent_sensitive",
       "general": "intent_sensitive"
     },
@@ -282,7 +285,7 @@ fi
 
 # Scenarios directory starts empty on the user side; the hook falls through
 # to the bundled scenarios shipped with the skill. Users who want to edit
-# a scenario run `/reflect-and-refine customize scenario <name>` which
+# a scenario run `/rnr customize scenario <name>` which
 # copies the bundled file into $CONFIG_DIR/prompts/scenarios/ for editing.
 
 # Register additional skills if requested. When registering a known
